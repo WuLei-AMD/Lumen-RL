@@ -573,6 +573,16 @@ class RLTrainer:
         extra = getattr(atom_cfg, "engine_kwargs", {}) or {}
         if extra:
             engine_kwargs.update(dict(extra))
+        engine_kwargs.pop("train_align", None)
+        engine_kwargs.pop("train_align_m", None)
+        if getattr(atom_cfg, "train_align", False):
+            from lumenrl.core.atom_train_align import activate
+
+            length = int(getattr(atom_cfg, "train_align_m", 0) or 0)
+            if length <= 1:
+                length = int(self.config.policy.max_total_sequence_length)
+            activate(length)
+            logger.info("ATOM train-align on: prefill M=%d, LUMEN_ROLLOUT=ATOM", length)
 
         colocation_wg = getattr(self, "_rollout_wg", None) or self._actor_wg
         if colocation_wg is not self._actor_wg:

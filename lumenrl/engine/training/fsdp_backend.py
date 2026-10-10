@@ -265,6 +265,11 @@ def _apply_lumen_fp8(model: nn.Module, quant_config: dict[str, Any]) -> nn.Modul
     # norm/sdpa/linear/mlp with AITER kernels so the training-side forward matches
     # the AITER-based vLLM rollout. Works in pure BF16 (no FP8 quant).
     lumen_rollout = quant_config.get("rollout") or os.environ.get("LUMEN_ROLLOUT", "")
+    from lumenrl.core.atom_train_align import enabled as atom_train_align_enabled
+    from lumenrl.core.atom_train_align import lumen_rollout_name
+
+    if atom_train_align_enabled():
+        lumen_rollout = lumen_rollout_name()
 
     if not (fp8_enabled or fp8_pm or lumen_norm or fused_mlp or fused_rope or lumen_rollout):
         return model

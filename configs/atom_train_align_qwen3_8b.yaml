@@ -1,0 +1,58 @@
+# Qwen3-8B BF16. Training forward uses Lumen rollout=ATOM.
+# ATOM decode places each token back into this prefill M so the selected-token
+# logprob matches that forward. train_align_m=93 is the frozen-token case.
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1
+
+policy:
+  model_name: /home/leiwu/models/Qwen3-8B
+  training_backend: fsdp2
+  generation_backend: atom
+  max_total_sequence_length: 93
+  max_response_length: 92
+  train_global_batch_size: 1
+  train_micro_batch_size: 1
+  generation:
+    atom_cfg:
+      train_align: true
+      train_align_m: 93
+      tensor_parallel_size: 1
+      kv_cache_dtype: bf16
+      gpu_memory_utilization: 0.5
+      enable_prefix_caching: false
+      transport: fifo
+
+algorithm:
+  name: grpo
+  grpo:
+    num_generations: 1
+    kl_coeff: 0.0
+    clip_ratio: 0.2
+    num_ppo_epochs: 1
+    num_mini_batches: 1
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    enabled: false
+
+reward:
+  type: function
+  function: math_reward
+  dataset: ""
+
+checkpointing:
+  checkpoint_dir: results/atom_train_align_qwen3_8b
+  save_steps: 0
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 1
+seed: 42

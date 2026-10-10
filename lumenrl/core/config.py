@@ -249,6 +249,10 @@ class AtomConfig:
     enable_prefix_caching: bool = False
     online_quant_config: Optional[dict] = None
     engine_kwargs: dict[str, Any] = field(default_factory=dict)
+    # Match ATOM decode to the Lumen rollout=ATOM prefill contract.
+    # 0 uses policy.max_total_sequence_length as the prefill M.
+    train_align: bool = False
+    train_align_m: int = 0
 
 
 @dataclass
@@ -977,6 +981,14 @@ class LumenRLConfig:
         # single source of truth in ``r3_scope`` (imported directly, not via
         # ``lumenrl.moe``, to avoid cycling through ``R3Manager``). Runs on
         # ``OmegaConf.to_object`` too, so ``from_yaml`` needs no extra check.
+        atom_cfg = self.policy.generation.atom_cfg
+        if getattr(atom_cfg, "train_align", False):
+            from lumenrl.core.atom_train_align import activate
+
+            length = int(getattr(atom_cfg, "train_align_m", 0) or 0)
+            if length <= 1:
+                length = int(self.policy.max_total_sequence_length)
+            activate(length)
         if not self.moe.r3.enabled:
             return
         from lumenrl.moe.r3_scope import assert_supported_r3
