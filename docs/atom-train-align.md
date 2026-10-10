@@ -30,15 +30,4 @@ The flag defaults off. A normal ATOM rollout keeps `split_k4` and paged attentio
 
 ## Qwen3-8B case
 
-`examples/ATOM-Train-Align` and `configs/atom_train_align_qwen3_8b.yaml`.
-
-Eager, TP=1, 93 tokens, one GPU:
-
-| | original decode | train-align decode |
-|---|---|---|
-| prefill | 14.73 ms | 14.78 ms |
-| per token | 13.84 ms | 23.93 ms |
-| 36-layer forward | 13.58 ms | 23.60 ms |
-| LM head | 0.25 ms | 0.32 ms |
-
-Of the extra 939 ms across 93 steps, about 200 ms is kernel time: padded GEMMs (+78 ms), the zero-fill / copy / K-V cat (+99 ms), QKV `split_k1` instead of `split_k4` (+16 ms), and varlen instead of paged attention (+5 ms). The rest is the host sync inside each placement.
+Runbook: [`examples/ATOM-Train-Align/README.md`](../examples/ATOM-Train-Align/README.md). Config: `configs/atom_train_align_qwen3_8b.yaml`.
