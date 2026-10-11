@@ -28,6 +28,21 @@ Loading that config exports `ATOM_TRAIN_ALIGN=1`, `ATOM_TRAIN_ALIGN_M`, `ATOM_BI
 
 The flag defaults off. A normal ATOM rollout keeps `split_k4` and paged attention.
 
+## Dense decode fast path
+
+Qwen3 dense decode keeps the aligned M inside all 36 transformer layers. It
+places the embedding once, runs QKV, o_proj, gate/up, and down at that M, and
+only writes the current row at each attention boundary. The host decode
+position is cached on the forward context, and the contiguous K/V history and
+padding tensors are reused.
+
+This removes repeated allocations and three independent placements per layer.
+For the 93-token Qwen3-8B case eager TP=1 decode went from 23.93 ms/token
+to 17.72, then 16.39. K is written straight into the history buffer and the
+bitwise path no longer writes the paged cache, which brings decode to 15.21
+ms/token. Hidden, full logits, and selected-token logprob stay bitwise
+identical. This path currently requires single-sequence decode.
+
 ## Qwen3-8B case
 
 Runbook: [`examples/ATOM-Train-Align/README.md`](../examples/ATOM-Train-Align/README.md). Config: `configs/atom_train_align_qwen3_8b.yaml`.

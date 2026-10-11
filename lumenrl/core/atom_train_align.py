@@ -32,6 +32,7 @@ QKV_SPLITK1 = (
 # N=24576 projection. Down is K=12288. o_proj and the LM head are padded by
 # their own callers; they are not in this set.
 PAD_WEIGHTS = {(24576, 4096), (4096, 12288)}
+_PAD_WORKSPACES = {}
 
 ENV_M = "ATOM_TRAIN_ALIGN_M"
 ENV_BITWISE_M = "ATOM_BITWISE_M"
@@ -84,18 +85,39 @@ def bind_lumen_rollout() -> None:
     os.environ[ENV_LUMEN_ROLLOUT] = "ATOM"
 
 
+def bitwise_position(ctx=None) -> int:
+    """Read a decode position once per forward context, then reuse the host value."""
+    if ctx is None:
+        from atom.utils.forward_context import get_forward_context
+
+        ctx = get_forward_context().context
+    if ctx is None or ctx.is_prefill:
+        return -1
+    position = getattr(ctx, "_atom_bitwise_position", None)
+    if position is None:
+        position = int(ctx.positions.reshape(-1)[0].item())
+        ctx._atom_bitwise_position = position
+    return position
+
+
 def place_decode_row(activation, length: int, position: int):
-    """Write one decode row into a zero prefill tensor and return ``(padded, position)``."""
+    """Write one decode row into a reusable prefill-shaped workspace."""
     import torch
 
     if length <= 1 or activation.dim() != 2 or activation.shape[0] != 1:
         return None
     if position < 0 or position >= length:
         return None
-    padded = torch.zeros(
-        length, activation.shape[-1], dtype=activation.dtype, device=activation.device
-    )
+    key = (activation.device, activation.dtype, length, activation.shape[-1])
+    workspace = _PAD_WORKSPACES.get(key)
+    if workspace is None:
+        padded = torch.zeros(
+            length, activation.shape[-1], dtype=activation.dtype, device=activation.device
+        )
+    else:
+        padded = workspace
     padded[position : position + 1] = activation
+    _PAD_WORKSPACES[key] = padded
     return padded, position
 
 
@@ -113,7 +135,7 @@ def bitwise_place(activation):
     ctx = get_forward_context().context
     if ctx is None or ctx.is_prefill:
         return None
-    position = int(ctx.positions.reshape(-1)[0].item())
+    position = bitwise_position(ctx)
     return place_decode_row(activation, length, position)
 
 
@@ -160,6 +182,7 @@ def install() -> Optional[int]:
         # The env flags above are what the GPU worker reads.
         return length
     linear.bitwise_m = configured_m
+    linear.bitwise_position = bitwise_position
     linear.bitwise_place = bitwise_place
     linear._QKV_SPLITK1 = QKV_SPLITK1
     linear._PAD_WEIGHTS = PAD_WEIGHTS

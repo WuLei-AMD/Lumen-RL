@@ -14,7 +14,7 @@ policy:
       train_align_m: 93
 ```
 
-`train_align` 默认关。打开后进程里是 `ATOM_TRAIN_ALIGN=1`、`ATOM_TRAIN_ALIGN_M=93`、`ATOM_BITWISE_M=93`、`LUMEN_ROLLOUT=ATOM`。
+`train_align` 默认关。打开后进程里是 `ATOM_TRAIN_ALIGN=1`、`ATOM_TRAIN_ALIGN_M=93`、`ATOM_BITWISE_M=93`、`LUMEN_ROLLOUT=ATOM`。当前 decode 只支持单序列；一条 batch 里有多条序列时不要打开。
 
 ## 环境
 
@@ -71,14 +71,14 @@ python compare_prefill_decode.py \
 
 同一条 eager 路径，prefill 是 93 个 token 一次前向加 lm_head。decode 是逐 token 的层前向加 lm_head。没有采样，也没有训练那一次前向。
 
-| | 原始 decode | `ATOM_BITWISE_M=93` |
+| | 原始 decode | 当前 `ATOM_BITWISE_M=93` |
 |---|---|---|
-| prefill | 14.73 ms | 14.78 ms |
-| 每个 token | 13.84 ms | 23.93 ms |
-| 36 层前向 | 13.58 ms | 23.60 ms |
-| lm_head | 0.25 ms | 0.32 ms |
+| prefill | 15.02 ms | 15.44 ms |
+| 每个 token | 14.31 ms | 15.21 ms |
+| 36 层前向 | 14.05 ms | 14.87 ms |
+| lm_head | 0.25 ms | 0.33 ms |
 
-93 步墙钟从 1286.7 ms 到 2225.6 ms。多出来的时间在 36 层前向。lm_head 大约多 0.08 ms/token。
+最初逐算子 padding 的 bit-match 路径是 23.93 ms/token。之后降到 17.72，再降到 16.39。当前 K 直接写入历史缓冲，bitwise decode 不再写 paged cache，是 15.21 ms/token。hidden、完整 logits 和 selected-token logprob 仍然都是 0 mismatch。
 
 ```bash
 MASTER_PORT=29721 python compare-out/bench_bitwise_perf.py
