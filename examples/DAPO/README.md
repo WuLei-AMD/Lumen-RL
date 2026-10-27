@@ -144,6 +144,10 @@ Common environment variables:
 `EXTRA_OVERRIDE` is passed as OmegaConf CLI overrides. Paths in it must already
 be expanded absolute paths.
 
+Qwen3-8B dense BF16 train/rollout alignment, including which switches are
+already measured and which paths not to repeat, is in
+[qwen3-8b-dense-bf16-align.md](qwen3-8b-dense-bf16-align.md).
+
 ## Monitoring
 
 ```bash
@@ -159,6 +163,7 @@ OOM/NaN/traceback.
 ```text
 examples/DAPO/
 ├── README.md
+├── qwen3-8b-dense-bf16-align.md
 ├── run_dapo.sh
 ├── atom_aiter_shim/sitecustomize.py
 └── configs/
