@@ -1533,6 +1533,19 @@ class LumenActorWorker(BaseWorker):
                     full = full.to(torch.bfloat16)
                 if not full.is_cuda:
                     full = full.to("cuda", non_blocking=True)
+                if (
+                    os.environ.get("LUMENRL_ALIGN_SYNC_WEIGHTS") == "1"
+                    and name.endswith("layers.0.self_attn.q_proj.weight")
+                ):
+                    import zlib
+
+                    sample = full.detach().view(torch.int16).reshape(-1)[:256].contiguous()
+                    crc = zlib.crc32(sample.cpu().numpy().tobytes()) & 0xFFFFFFFF
+                    print(
+                        f"lumenrl weight fingerprint side=train rank={self.rank} "
+                        f"crc={crc:08x} numel={full.numel()}",
+                        flush=True,
+                    )
                 yield name, full
 
         # ATOM's ModelRunner opens the staging buffer once per update cycle and

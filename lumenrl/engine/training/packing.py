@@ -21,6 +21,7 @@ Usage in training step::
 from __future__ import annotations
 
 import logging
+import os
 from typing import NamedTuple, Tuple
 
 import torch
@@ -225,7 +226,13 @@ def packed_token_log_probs(
     not_last = torch.ones(total_tokens, dtype=torch.bool, device=device)
     not_last[cu_seqlens[1:].long() - 1] = False
 
-    if _FUSED_CROSS_ENTROPY is not None and logits.is_cuda:
+    # ATOM records torch.log_softmax(logits.float()). The fused Triton
+    # cross-entropy sits about 1e-6 away from that reduction. Rowwise
+    # attention is the path that is compared with those records, so it
+    # uses the same float32 log_softmax.
+    exact_log_softmax = os.environ.get("LUMENRL_ROWWISE_TRAIN_ATTN", "0") == "1"
+
+    if _FUSED_CROSS_ENTROPY is not None and logits.is_cuda and not exact_log_softmax:
         # Fused path: one Triton kernel over the full (total_tokens, V) buffer,
         # with the backward writing dlogits in place. Never materializes a
         # log_softmax tensor, and the boundary rows are dropped *after* the
@@ -253,6 +260,8 @@ def packed_token_log_probs(
     for start in range(0, shifted_logits.shape[0], chunk_size):
         end = min(start + chunk_size, shifted_logits.shape[0])
         z = shifted_logits[start:end]
+        if exact_log_softmax:
+            z = z.float()
         if temperature != 1.0:
             z = z / temperature
         row_lp = F.log_softmax(z, dim=-1)
@@ -360,6 +369,50 @@ def unpack_log_probs(
 _original_attn_fn = None  # saved reference to the previous sdpa function
 
 
+def _rowwise_varlen_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    dropout: float,
+    softmax_scale: float,
+    needs_grad: bool,
+) -> torch.Tensor:
+    """Evaluate packed causal attention as q_len=1 calls.
+
+    This diagnostic alignment mode gives training the same attention reduction
+    shape as ATOM decode: one query row over its already-written KV prefix.
+    It remains an autograd-attached training forward, but launches O(tokens)
+    attention kernels and is therefore unsuitable for normal training.
+    """
+    from aiter import flash_attn_varlen_func
+
+    one_q = torch.tensor([0, 1], dtype=torch.int32, device=q.device)
+    rows: list[torch.Tensor] = []
+    for seq in range(int(cu_seqlens.numel()) - 1):
+        start, end = (int(x) for x in cu_seqlens[seq : seq + 2].tolist())
+        for offset, index in enumerate(range(start, end)):
+            key_len = offset + 1
+            result = flash_attn_varlen_func(
+                q[index : index + 1],
+                k[start : start + key_len],
+                v[start : start + key_len],
+                cu_seqlens_q=one_q,
+                cu_seqlens_k=torch.tensor(
+                    [0, key_len], dtype=torch.int32, device=q.device
+                ),
+                max_seqlen_q=1,
+                max_seqlen_k=key_len,
+                min_seqlen_q=0,
+                dropout_p=dropout,
+                softmax_scale=softmax_scale,
+                causal=True,
+                return_lse=needs_grad,
+            )
+            rows.append(result[0] if isinstance(result, tuple) else result)
+    return torch.cat(rows, dim=0)
+
+
 def _varlen_attention_forward(
     module: torch.nn.Module,
     query: torch.Tensor,
@@ -403,19 +456,26 @@ def _varlen_attention_forward(
         t.requires_grad for t in [q, k, v]
     )
 
-    result = flash_attn_varlen_func(
-        q, k, v,
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_k=cu_seqlens,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_k=max_seqlen,
-        dropout_p=dropout,
-        softmax_scale=softmax_scale,
-        causal=True,
-        return_lse=needs_grad,
-    )
-
-    attn_output = result[0] if isinstance(result, tuple) else result
+    if os.environ.get("LUMENRL_ROWWISE_TRAIN_ATTN", "0") == "1":
+        # Keep the no-grad old-logprob pass on the same AITER forward variant
+        # as the autograd pass and aligned rollout.  The LSE is required for
+        # backward and otherwise changes the selected varlen specialization.
+        attn_output = _rowwise_varlen_attention(
+            q, k, v, cu_seqlens, dropout, softmax_scale, True
+        )
+    else:
+        result = flash_attn_varlen_func(
+            q, k, v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            dropout_p=dropout,
+            softmax_scale=softmax_scale,
+            causal=True,
+            return_lse=needs_grad,
+        )
+        attn_output = result[0] if isinstance(result, tuple) else result
     # Reshape back to (B, S, H_q, D) for HF
     attn_output = attn_output.view(B_dim, S_dim, H_q, D).contiguous()
     return attn_output, None

@@ -47,6 +47,9 @@ if not logger.handlers and not logging.getLogger().handlers:
     _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     logger.addHandler(_h)
 
+_AITER_PATCH_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "aiter_patch")
+_AITER_PATCH_DIR = os.path.normpath(_AITER_PATCH_DIR)
+
 _VLLM_RUNTIME_ENV_KEYS = (
     "NCCL_IB_DISABLE",
     "NCCL_SOCKET_IFNAME",
@@ -64,10 +67,21 @@ _VLLM_RUNTIME_ENV_KEYS = (
     "LUMENRL_DIAG_ALL_GATHER",
     "LUMENRL_DIAG_ALL_GATHER_NUMEL",
     "LUMENRL_WEIGHT_SYNC_INTEGRITY",
+    # When set to "1", patches TunedGemm.mm in every ATOM worker process to
+    # pad M to the nearest splitK=1 bucket (see lumenrl/aiter_patch/).
+    # Must match the Lumen training side (LumenConfig._stable_tgemm_mm checks
+    # the same var) so both sides use identical kernel paths.
+    "LUMENRL_STABLE_GEMM",
+    # Full private BF16 GEMM table. aiter reads this before its first lookup
+    # and does not scan model_configs/ when it is set.
+    "AITER_CONFIG_GEMM_BF16",
 )
 
 
 def _copy_vllm_runtime_env(env_vars: dict[str, str]) -> None:
+    from lumenrl.engine.private_gemm import use_private_bf16_gemm_table
+
+    use_private_bf16_gemm_table()
     for key in _VLLM_RUNTIME_ENV_KEYS:
         if key in os.environ:
             env_vars[key] = os.environ[key]
@@ -577,6 +591,18 @@ class VLLMReplicaManager:
                 "LUMEN_REPLICA_RANK": str(r),
                 "LUMEN_RAY_JOB_ID": str(job_id),
             }
+            # When LUMENRL_STABLE_GEMM=1, prepend lumenrl/aiter_patch/ to
+            # PYTHONPATH so every ATOM worker and its EngineCore subprocesses
+            # auto-load sitecustomize.py at Python startup.  The patch wraps
+            # TunedGemm.mm to pad M to the nearest splitK=1 bucket.
+            # LUMENRL_STABLE_GEMM itself is forwarded via _VLLM_RUNTIME_ENV_KEYS.
+            if os.environ.get("LUMENRL_STABLE_GEMM", "0") == "1" and os.path.isdir(_AITER_PATCH_DIR):
+                existing = os.environ.get("PYTHONPATH", "")
+                env_vars["PYTHONPATH"] = (
+                    _AITER_PATCH_DIR + os.pathsep + existing
+                    if existing
+                    else _AITER_PATCH_DIR
+                )
             _copy_vllm_runtime_env(env_vars)
             server = remote_cls.options(
                 num_gpus=0,  # pinned manually via CUDA_VISIBLE_DEVICES; no Ray GPU slot

@@ -755,6 +755,10 @@ class RLTrainer:
             sp["temperature"] = 1.0
         if want_logprobs:
             sp["logprobs"] = 0
+        # Sampling stops at EOS well short of the 2048-token attention boundary.
+        # Set this only when a run must score response positions past that point.
+        if os.environ.get("LUMENRL_IGNORE_EOS") == "1":
+            sp["ignore_eos"] = True
         return sp
 
     def _ray_eval_sampling_params(self) -> dict[str, Any]:
@@ -4146,6 +4150,25 @@ class RLTrainer:
             reward_time = time.time() - reward_t0
             response_mask = self._build_response_mask(sequences, seq_mask, prompt_lengths)
             response_lengths = [int(response_mask[i].sum().item()) for i in range(response_mask.shape[0])]
+            trace_dir = os.environ.get("LUMENRL_TRAIN_DECODE_TRACE_DIR", "")
+            if trace_dir and self._rank == 0 and rollout_lp is not None:
+                # Opt-in forensic capture for an exact train-vs-decode replay.
+                # These are pre-update values; writing CPU tensors keeps the
+                # worker forward and its reductions unchanged.
+                os.makedirs(trace_dir, exist_ok=True)
+                trace_path = os.path.join(trace_dir, f"step-{step:05d}.pt")
+                torch.save(
+                    {
+                        "input_ids": sequences.cpu(),
+                        "attention_mask": seq_mask.cpu(),
+                        "response_mask": response_mask.cpu(),
+                        "old_log_probs": old_log_probs.cpu(),
+                        "rollout_log_probs": rollout_lp.cpu(),
+                        "prompt_lengths": prompt_lengths,
+                    },
+                    trace_path,
+                )
+                logger.info("[step=%d] saved train/decode trace to %s", step, trace_path)
 
             tensors = {
                 "input_ids": sequences,

@@ -32,6 +32,13 @@ if [ ! -f "$ATOM_DIR/atom/rollout/async_engine.py" ]; then
 fi
 cd "$RL_ROOT/Lumen-RL"
 
+# Complete private BF16 GEMM table. Set before Python imports aiter; the ATOM
+# worker receives it through atom_ray_server's env forward list.
+_PRIVATE_GEMM="$RL_ROOT/Lumen-RL/configs/qwen3_8b_bf16_tuned_gemm.private.csv"
+if [ -z "${AITER_CONFIG_GEMM_BF16:-}" ] && [ -f "$_PRIVATE_GEMM" ]; then
+  export AITER_CONFIG_GEMM_BF16="$_PRIVATE_GEMM"
+fi
+
 # ---- 通用 env（BF16/FP8 共用）----
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false TORCHDYNAMO_DISABLE=1 HYDRA_FULL_ERROR=1
 export NCCL_TIMEOUT=7200 NCCL_CUMEM_ENABLE=0
@@ -112,6 +119,17 @@ if [ "$MODE" = "atomfp8" ] || [ "$MODE" = "atom_fp8" ] || \
   # 这条路径本身，不属于某几个例子编号——手工调 run_dapo.sh 的人同样漏不掉。
   # ATOM 自己的修复进入所钉的 commit 后即可删除。
   export ATOM_FORCE_ATTN_TRITON="${ATOM_FORCE_ATTN_TRITON:-1}"
+  if [ "$ATOM_BF16" = "1" ]; then
+    # Train with the six ATOM ops, and score decode with the same aiter RoPE
+    # and flash_attn_varlen as prefill. The gather allocates each step, so this
+    # path stays eager; level=3 FULL graphs replay fixed addresses and abort.
+    export LUMEN_ATOM_OPS="${LUMEN_ATOM_OPS:-rmsnorm,residual_rmsnorm,qkv,rope,varlen_attn,gate_up}"
+    export LUMENRL_ALIGN_DECODE="${LUMENRL_ALIGN_DECODE:-1}"
+    # Decode logprobs diverge from the packed prefill once a query reads past
+    # 2048 keys. The loss uses one prefill of the finished sequence instead.
+    export LUMENRL_PREFILL_RESCORE="${LUMENRL_PREFILL_RESCORE:-1}"
+    export LUMENRL_RESCORE_DIR="${LUMENRL_RESCORE_DIR:-/tmp/lumenrl-prefill-rescore}"
+  fi
   export VLLM_ROCM_USE_AITER=0 VLLM_ROCM_USE_AITER_MHA=0 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=0 VLLM_ROCM_USE_AITER_LINEAR=0
   # Match the vLLM fp8 training-side configuration exactly: standard Lumen FP8
   # blockwise2d linear + norm, no HF attention patch and no rollout-specific
@@ -148,13 +166,24 @@ if [ "$MODE" = "atomfp8" ] || [ "$MODE" = "atom_fp8" ] || \
   fi
   # no-eager level=3 正式方案：enforce_eager=false + compilation_config.level=3 + sleep2
   # （sleep_mode 训练前释放 rollout KV/weights/CUDA graph，避免 backward OOM）。
-  EXTRA_ARGS+=(
-    policy.generation.vllm_cfg.enforce_eager=false
-    policy.generation.atom_cfg.engine_kwargs.enforce_eager=false
-    policy.generation.atom_cfg.engine_kwargs.compilation_config.level=3
-    policy.generation.vllm_cfg.enable_sleep_mode=true
-    policy.generation.vllm_cfg.sleep_level=2
-  )
+  # BF16 对齐 decode 在每次 forward 里 gather KV，地址不固定，FULL graph 重放会失败。
+  if [ "${LUMENRL_ALIGN_DECODE:-0}" = "1" ]; then
+    EXTRA_ARGS+=(
+      policy.generation.vllm_cfg.enforce_eager=true
+      policy.generation.atom_cfg.engine_kwargs.enforce_eager=true
+      policy.generation.atom_cfg.engine_kwargs.compilation_config.level=0
+      policy.generation.vllm_cfg.enable_sleep_mode=true
+      policy.generation.vllm_cfg.sleep_level=2
+    )
+  else
+    EXTRA_ARGS+=(
+      policy.generation.vllm_cfg.enforce_eager=false
+      policy.generation.atom_cfg.engine_kwargs.enforce_eager=false
+      policy.generation.atom_cfg.engine_kwargs.compilation_config.level=3
+      policy.generation.vllm_cfg.enable_sleep_mode=true
+      policy.generation.vllm_cfg.sleep_level=2
+    )
+  fi
   if [ "$ATOM_BF16" = "0" ]; then
     ATOM_ONLINE_QUANT="${ATOM_ONLINE_QUANT:-per_block_fp8}"
     EXTRA_ARGS+=(
