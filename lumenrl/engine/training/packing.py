@@ -232,6 +232,21 @@ def packed_token_log_probs(
     # uses the same float32 log_softmax.
     exact_log_softmax = os.environ.get("LUMENRL_ROWWISE_TRAIN_ATTN", "0") == "1"
 
+    # ATOM's rollout blanks the padded vocabulary tail before that log_softmax:
+    # ModelRunnerExt.postprocess sets logits[..., n:] = -inf for n =
+    # true_vocab_size, the tokenizer's real token count (151669 against a
+    # 151936-row lm_head on Qwen3-8B). Training otherwise sums those extra
+    # columns into its denominator, so every rollout log-prob sits above the
+    # training one by about the tail probability mass. Setting this to the same
+    # n puts both sides on one denominator. The mask needs its own float32
+    # copy of each chunk, so it takes the chunked path rather than the fused
+    # kernel, which writes dlogits in place.
+    vocab_mask = int(os.environ.get("LUMENRL_TRAIN_VOCAB_MASK", "0") or 0)
+    if vocab_mask >= logits.shape[-1]:
+        vocab_mask = 0
+    if vocab_mask:
+        exact_log_softmax = True
+
     if _FUSED_CROSS_ENTROPY is not None and logits.is_cuda and not exact_log_softmax:
         # Fused path: one Triton kernel over the full (total_tokens, V) buffer,
         # with the backward writing dlogits in place. Never materializes a
@@ -264,6 +279,8 @@ def packed_token_log_probs(
             z = z.float()
         if temperature != 1.0:
             z = z / temperature
+        if vocab_mask:
+            z[..., vocab_mask:] = float("-inf")
         row_lp = F.log_softmax(z, dim=-1)
         lp_parts.append(
             row_lp.gather(-1, shifted_targets[start:end]).squeeze(-1)
