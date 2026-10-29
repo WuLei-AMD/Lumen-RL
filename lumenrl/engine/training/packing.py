@@ -386,48 +386,90 @@ def unpack_log_probs(
 _original_attn_fn = None  # saved reference to the previous sdpa function
 
 
+_row_meta_cache: tuple | None = None
+
+
+def _packed_rows(cu_seqlens: torch.Tensor, total: int):
+    """Row starts and lengths for ``cu_seqlens``, shared by all layers of a forward."""
+    global _row_meta_cache
+    from lumenrl.aiter_patch.qlen1_attention import packed_causal_rows
+
+    cached = _row_meta_cache
+    if cached is not None and cached[0] is cu_seqlens and cached[1] == total:
+        return cached[2]
+    rows = packed_causal_rows(cu_seqlens, total)
+    # Holding the tensor keeps its id unique while it is the cache key.
+    _row_meta_cache = (cu_seqlens, total, rows)
+    return rows
+
+
+class _RowwiseAttention(torch.autograd.Function):
+    """q_len=1 attention values with the gradient of ordinary causal attention.
+
+    The forward is the decode-shaped call that matches ATOM bit for bit. Its
+    backward recomputes the full-sequence causal varlen attention and
+    differentiates that. Both compute the same function, so the gradient is
+    the attention gradient up to rounding; only the forward values are
+    required to be bitwise.
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, cu_seqlens, max_seqlen, softmax_scale):
+        from lumenrl.aiter_patch.qlen1_attention import row_prefix_attention
+
+        starts, lens = _packed_rows(cu_seqlens, q.shape[0])
+        out = row_prefix_attention(q, k, v, starts, lens, max_seqlen, softmax_scale)
+        ctx.save_for_backward(q, k, v, cu_seqlens)
+        ctx.max_seqlen = max_seqlen
+        ctx.softmax_scale = softmax_scale
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        from aiter import flash_attn_varlen_func
+
+        q, k, v, cu_seqlens = ctx.saved_tensors
+        with torch.enable_grad():
+            q_ = q.detach().requires_grad_()
+            k_ = k.detach().requires_grad_()
+            v_ = v.detach().requires_grad_()
+            result = flash_attn_varlen_func(
+                q_, k_, v_,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=ctx.max_seqlen,
+                max_seqlen_k=ctx.max_seqlen,
+                dropout_p=0.0,
+                softmax_scale=ctx.softmax_scale,
+                causal=True,
+                return_lse=True,
+            )
+            out = result[0] if isinstance(result, tuple) else result
+            torch.autograd.backward(out, grad_out)
+        return q_.grad, k_.grad, v_.grad, None, None, None
+
+
 def _rowwise_varlen_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     cu_seqlens: torch.Tensor,
-    dropout: float,
+    max_seqlen: int,
     softmax_scale: float,
     needs_grad: bool,
 ) -> torch.Tensor:
-    """Evaluate packed causal attention as q_len=1 calls.
+    """Evaluate packed causal attention with ATOM decode's q_len=1 arithmetic.
 
-    This diagnostic alignment mode gives training the same attention reduction
-    shape as ATOM decode: one query row over its already-written KV prefix.
-    It remains an autograd-attached training forward, but launches O(tokens)
-    attention kernels and is therefore unsuitable for normal training.
+    Every token is one query row over its own KV prefix, the reduction ATOM
+    decode runs. All rows go through one launch per layer
+    (``lumenrl.aiter_patch.qlen1_attention``).
     """
-    from aiter import flash_attn_varlen_func
+    if needs_grad:
+        return _RowwiseAttention.apply(q, k, v, cu_seqlens, max_seqlen, softmax_scale)
+    from lumenrl.aiter_patch.qlen1_attention import row_prefix_attention
 
-    one_q = torch.tensor([0, 1], dtype=torch.int32, device=q.device)
-    rows: list[torch.Tensor] = []
-    for seq in range(int(cu_seqlens.numel()) - 1):
-        start, end = (int(x) for x in cu_seqlens[seq : seq + 2].tolist())
-        for offset, index in enumerate(range(start, end)):
-            key_len = offset + 1
-            result = flash_attn_varlen_func(
-                q[index : index + 1],
-                k[start : start + key_len],
-                v[start : start + key_len],
-                cu_seqlens_q=one_q,
-                cu_seqlens_k=torch.tensor(
-                    [0, key_len], dtype=torch.int32, device=q.device
-                ),
-                max_seqlen_q=1,
-                max_seqlen_k=key_len,
-                min_seqlen_q=0,
-                dropout_p=dropout,
-                softmax_scale=softmax_scale,
-                causal=True,
-                return_lse=needs_grad,
-            )
-            rows.append(result[0] if isinstance(result, tuple) else result)
-    return torch.cat(rows, dim=0)
+    starts, lens = _packed_rows(cu_seqlens, q.shape[0])
+    return row_prefix_attention(q, k, v, starts, lens, max_seqlen, softmax_scale)
 
 
 def _varlen_attention_forward(
@@ -473,12 +515,9 @@ def _varlen_attention_forward(
         t.requires_grad for t in [q, k, v]
     )
 
-    if os.environ.get("LUMENRL_ROWWISE_TRAIN_ATTN", "0") == "1":
-        # Keep the no-grad old-logprob pass on the same AITER forward variant
-        # as the autograd pass and aligned rollout.  The LSE is required for
-        # backward and otherwise changes the selected varlen specialization.
+    if os.environ.get("LUMENRL_ROWWISE_TRAIN_ATTN", "0") == "1" and dropout == 0.0:
         attn_output = _rowwise_varlen_attention(
-            q, k, v, cu_seqlens, dropout, softmax_scale, True
+            q, k, v, cu_seqlens, max_seqlen, softmax_scale, needs_grad
         )
     else:
         result = flash_attn_varlen_func(
@@ -514,8 +553,17 @@ def patch_attention_for_packing() -> bool:
         logger.warning("Cannot import ALL_ATTENTION_FUNCTIONS; packing attention patch skipped.")
         return False
 
-    # Save the current sdpa function (should be Lumen's _lumen_aiter_attention_forward)
-    _original_attn_fn = ALL_ATTENTION_FUNCTIONS.get("sdpa")
+    # Save the current sdpa function (should be Lumen's
+    # _lumen_aiter_attention_forward). Actor and frozen-reference workers can
+    # share a process through an ActorRefFusedWorker, so initialization reaches
+    # this function twice. Do not capture this wrapper as its own fallback on
+    # the second call: the reference's non-packed forward would recurse forever.
+    current_attn_fn = ALL_ATTENTION_FUNCTIONS.get("sdpa")
+    if current_attn_fn is _varlen_attention_forward:
+        logger.info("Packing: HF sdpa attention already uses the varlen patch.")
+        return True
+
+    _original_attn_fn = current_attn_fn
     if _original_attn_fn is None:
         logger.warning("No 'sdpa' attention function registered; packing patch skipped.")
         return False

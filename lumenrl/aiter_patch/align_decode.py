@@ -187,6 +187,46 @@ def patch_attention(module):
         import aiter
 
         meta = fwd_ctx.attn_metadata
+        sliding = (self.sliding_window, 0, 0) if self.sliding_window > 0 else (-1, -1, 0)
+        if (
+            os.environ.get("LUMENRL_ALIGN_CONTIG_KV", "0") == "1"
+            and int(meta.context_lens.shape[0]) == 1
+            and hasattr(self, "_lumenrl_k_history")
+        ):
+            # One sequence over the contiguous history: its length is known on
+            # the host, so the call needs no device-to-host synchronization.
+            # The step metadata is shared by every layer and built once.
+            history_len = int(self._lumenrl_k_history_len)
+            cached = getattr(meta, "_lumenrl_decode_cu", None)
+            if cached is None or cached[0] != history_len:
+                cu_k = torch.zeros(2, dtype=torch.int32, device=q.device)
+                cu_k[1:] = meta.context_lens[:1].to(dtype=torch.int32)
+                torch._assert_async(cu_k[1] == history_len)
+                if meta.cu_seqlens_q is not None and int(meta.cu_seqlens_q.shape[0]) == 2:
+                    cu_q = meta.cu_seqlens_q
+                else:
+                    cu_q = torch.arange(2, device=q.device, dtype=torch.int32)
+                cached = (history_len, cu_q, cu_k)
+                meta._lumenrl_decode_cu = cached
+            _, cu_q, cu_k = cached
+            result = aiter.flash_attn_varlen_func(
+                q,
+                self._lumenrl_k_history[:history_len],
+                self._lumenrl_v_history[:history_len],
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_k,
+                max_seqlen_q=int(meta.max_seqlen_q or 1),
+                max_seqlen_k=history_len,
+                min_seqlen_q=0,
+                dropout_p=0.0,
+                softmax_scale=self.scale,
+                causal=True,
+                window_size=sliding,
+                sink_ptr=self.sinks,
+                return_lse=True,
+            )
+            return result[0]
+
         lengths = meta.context_lens.to(dtype=torch.int32)
         nseq = int(lengths.shape[0])
         cu_k = torch.empty(nseq + 1, dtype=torch.int32, device=q.device)
@@ -269,6 +309,25 @@ def patch_attention(module):
 
         cu_q = meta.cu_seqlens_q
         cu_k = meta.cu_seqlens_k
+        if self.sinks is None and self.sliding_window <= 0:
+            from qlen1_attention import row_prefix_attention
+
+            starts: list[int] = []
+            lens: list[int] = []
+            q_bounds = cu_q.tolist()
+            k_bounds = cu_k.tolist()
+            for seq in range(len(q_bounds) - 1):
+                q_len = q_bounds[seq + 1] - q_bounds[seq]
+                prefix_len = k_bounds[seq + 1] - k_bounds[seq] - q_len
+                starts.extend([k_bounds[seq]] * q_len)
+                lens.extend(range(prefix_len + 1, prefix_len + q_len + 1))
+            rows = torch.tensor([starts, lens], dtype=torch.int32).to(
+                q.device, non_blocking=True
+            )
+            return row_prefix_attention(
+                q, k, v, rows[0], rows[1], max(lens), self.scale
+            )
+
         out = torch.empty_like(q)
         one = torch.tensor([0, 1], dtype=torch.int32, device=q.device)
         sliding = (self.sliding_window, 0, 0) if self.sliding_window > 0 else (-1, -1, 0)

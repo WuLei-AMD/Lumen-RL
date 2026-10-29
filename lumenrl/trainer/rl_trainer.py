@@ -1116,10 +1116,13 @@ class RLTrainer:
                 detached=actor_role.detached,
             )
             fused_wg.start()
-            self._rendezvous_ray_group(fused_wg)
             spawned = fused_wg.spawn(["actor", "ref"])
             self._actor_wg = spawned["actor"]
             self._ref_wg = spawned["ref"]
+            # Spawn first. The fused class exports actor_get_node_ip, not
+            # get_node_ip, and both roles share this process, so one process
+            # group from the actor view covers the reference model too.
+            self._rendezvous_ray_group(self._actor_wg)
             self._actor_wg.call_all(
                 "init_model",
                 forward_only=(
@@ -3782,6 +3785,16 @@ class RLTrainer:
         """
         tok = metrics.pop("mismatch_tok", None)
         n_seq = metrics.pop("mismatch_seq_n", None)
+        # Already the max across micro-batches and workers. Do not divide by
+        # token count; that would turn one large disagreement into a mean.
+        abs_max = metrics.pop("mismatch_abs_max", None)
+        if abs_max is not None:
+            metrics["mismatch/abs_max"] = abs_max
+        # A count of nonzero tokens. Workers already summed it; do not average
+        # it again or divide it by the token count.
+        count = metrics.pop("mismatch_count", None)
+        if count is not None:
+            metrics["mismatch/count"] = count
         per_token = {
             "mismatch_abs_sum": "mismatch/abs_diff",
             "mismatch_k3_sum": "mismatch/k3_kl",
@@ -3929,7 +3942,14 @@ class RLTrainer:
         keys = set().union(*(o.keys() for o in outputs))
         for key in keys:
             vals = [float(o[key]) for o in outputs if key in o]
-            merged[key] = float(sum(vals) / max(1, len(vals)))
+            # Workers already reduced micro-batches. This key is a max, so the
+            # cross-worker reduce is max as well; every other key stays a mean.
+            if key == "mismatch_abs_max":
+                merged[key] = float(max(vals)) if vals else 0.0
+            elif key == "mismatch_count":
+                merged[key] = float(sum(vals))
+            else:
+                merged[key] = float(sum(vals) / max(1, len(vals)))
         return merged
 
     def _reset_actor_memory_stats(self) -> None:
@@ -4270,6 +4290,10 @@ class RLTrainer:
             _pt = metrics.pop("ppo_kl_tok", None)
             if _ps is not None and _pt:
                 metrics["ppo_kl"] = _ps / max(_pt, 1e-6)
+            _kls = metrics.pop("kl_sum", None)
+            _klt = metrics.pop("kl_tok", None)
+            if _kls is not None and _klt:
+                metrics["actor/kl"] = _kls / max(_klt, 1e-6)
             self._finalize_mismatch_metrics(metrics)
 
             if _rc_metrics_ray:
