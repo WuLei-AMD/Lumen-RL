@@ -31,6 +31,8 @@ def test_matches_bruteforce():
         "mismatch/k3_kl": sum(math.exp(v) - v - 1 for v in vals) / n,
         "mismatch/chi2_token": sum((math.exp(v) - 1) ** 2 for v in vals) / n,
         "mismatch/frac_abs_gt_0.1": sum(1.0 for v in vals if abs(v) > 0.1) / n,
+        "mismatch/abs_max": max(abs(v) for v in vals),
+        "mismatch/count": sum(1 for v in vals if v != 0),
     }
     seq = [sum(float(delta[i, j]) for j in range(L)) for i in range(B)]
     want["mismatch/chi2_seq"] = sum((math.exp(s) - 1) ** 2 for s in seq) / B
@@ -71,6 +73,19 @@ def test_no_overflow_on_extreme_ratios():
     delta = torch.full((2, 64), 50.0)
     got = _compute(delta, torch.ones(2, 64))
     assert all(math.isfinite(v) for v in got.values()), got
+
+
+def test_micro_reduce_keeps_max_and_sums_count():
+    from lumenrl.engine.training.metric_reduce import reduce_listed_metrics
+
+    got = reduce_listed_metrics({
+        "mismatch_abs_max": [0.1, 0.4],
+        "mismatch_count": [2.0, 3.0],
+        "mismatch_abs_sum": [10.0, 30.0],
+    })
+    assert got["mismatch_abs_max"] == 0.4
+    assert got["mismatch_count"] == 5.0
+    assert got["mismatch_abs_sum"] == 20.0
 
 
 if __name__ == "__main__":

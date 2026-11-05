@@ -32,6 +32,7 @@ from lumenrl.utils.checkpoint import (
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.types import AlgorithmName, TrainingBackend
 from lumenrl.engine.training.base_engine import BaseEngine, EngineRegistry
+from lumenrl.engine.training.metric_reduce import reduce_listed_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -674,9 +675,7 @@ class LumenActorWorker(BaseWorker):
         with self._engine.train_mode():
             output = self._engine.train_batch(data, self._policy_loss_fn)
 
-        metrics: dict[str, float] = {}
-        for k, v in output.get("metrics", {}).items():
-            metrics[k] = (sum(v) / len(v)) if isinstance(v, list) and v else float(v)
+        metrics = reduce_listed_metrics(output.get("metrics", {}))
         if "loss" in output:
             lv = output["loss"]
             if isinstance(lv, list) and lv:
@@ -846,6 +845,10 @@ class LumenActorWorker(BaseWorker):
                 tok = float(mask.sum())
                 out_metrics["ppo_kl_sum"] = float(((old_logp - token_log_probs) * mask).sum())
                 out_metrics["ppo_kl_tok"] = tok
+                if kl_c > 0.0 and ref_logp is not None:
+                    # Token mean of (ref - policy) before kl_coeff scales the loss.
+                    out_metrics["kl_sum"] = float(((ref_logp - token_log_probs) * mask).sum())
+                    out_metrics["kl_tok"] = tok
                 rlp = data.get("rollout_log_probs")
                 if rlp is not None:
                     rlp = rlp.to(dev)[..., :L]
@@ -871,24 +874,9 @@ class LumenActorWorker(BaseWorker):
         """
         # exp() of a log-ratio: clamp so a pathological sequence cannot turn the
         # whole metric into inf and hide the rest.
-        w = torch.exp(delta.clamp(-10.0, 10.0))
-        seq_delta = delta.sum(dim=-1).clamp(-10.0, 10.0)
-        w_seq = torch.exp(seq_delta)
-        n_seq = float(delta.shape[0])
-        return {
-            # mean |delta|: the magnitude that the signed mean cancels away
-            "mismatch_abs_sum": float(delta.abs().sum()),
-            # k3 estimator E[e^r - r - 1] >= 0, unbiased and low-variance for small KL
-            "mismatch_k3_sum": float((((w - 1.0) - delta) * mask).sum()),
-            # second moment of the token-level IS weight: predicts gradient variance
-            "mismatch_chi2_tok_sum": float((((w - 1.0) ** 2) * mask).sum()),
-            # same at sequence level, where TIS actually clips
-            "mismatch_chi2_seq_sum": float(((w_seq - 1.0) ** 2).sum()),
-            "mismatch_seq_n": n_seq,
-            # tail mass: the population driving the divergence (expert flips)
-            "mismatch_tail_sum": float(((delta.abs() > 0.1).float() * mask).sum()),
-            "mismatch_tok": tok,
-        }
+        from lumenrl.engine.training.metric_reduce import mismatch_sums
+
+        return mismatch_sums(delta, mask, tok)
 
     def get_state_dict(self) -> dict[str, torch.Tensor]:
         """CPU full state dict for weight sync to rollout engines.

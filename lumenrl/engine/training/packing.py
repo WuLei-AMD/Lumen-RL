@@ -21,6 +21,7 @@ Usage in training step::
 from __future__ import annotations
 
 import logging
+import os
 from typing import NamedTuple, Tuple
 
 import torch
@@ -191,6 +192,28 @@ def pack_sequences(
     )
 
 
+def _vocab_mask_width(vocab: int) -> int:
+    """Tokenizer width ATOM keeps. ``0`` means the full lm_head row is real."""
+    n = int(os.environ.get("LUMENRL_TRAIN_VOCAB_MASK", "0") or 0)
+    if n <= 0 or n >= vocab:
+        return 0
+    return n
+
+
+def _mask_vocab_tail(logits: torch.Tensor) -> torch.Tensor:
+    """Blank the padded vocabulary columns ATOM drops before log_softmax.
+
+    The write is out of place. An in-place ``-inf`` on the float copy breaks
+    backward when that copy is the output of an earlier differentiable op,
+    such as the temperature division.
+    """
+    n = _vocab_mask_width(logits.shape[-1])
+    if n == 0:
+        return logits
+    tail = logits.new_full(logits[..., n:].shape, float("-inf"))
+    return torch.cat((logits[..., :n], tail), dim=-1)
+
+
 def packed_token_log_probs(
     logits: torch.Tensor,
     packed_ids: torch.Tensor,
@@ -225,7 +248,26 @@ def packed_token_log_probs(
     not_last = torch.ones(total_tokens, dtype=torch.bool, device=device)
     not_last[cu_seqlens[1:].long() - 1] = False
 
-    if _FUSED_CROSS_ENTROPY is not None and logits.is_cuda:
+    # ATOM records torch.log_softmax(logits.float()). The fused Triton
+    # cross-entropy sits about 1e-6 away from that reduction. Rowwise
+    # attention is the path that is compared with those records, so it
+    # uses the same float32 log_softmax.
+    exact_log_softmax = os.environ.get("LUMENRL_ROWWISE_TRAIN_ATTN", "0") == "1"
+
+    # ATOM's rollout blanks the padded vocabulary tail before that log_softmax:
+    # ModelRunnerExt.postprocess sets logits[..., n:] = -inf for n =
+    # true_vocab_size, the tokenizer's real token count (151669 against a
+    # 151936-row lm_head on Qwen3-8B). Training otherwise sums those extra
+    # columns into its denominator, so every rollout log-prob sits above the
+    # training one by about the tail probability mass. Setting this to the same
+    # n puts both sides on one denominator. The mask needs its own float32
+    # copy of each chunk, so it takes the chunked path rather than the fused
+    # kernel, which writes dlogits in place.
+    vocab_mask = _vocab_mask_width(logits.shape[-1])
+    if vocab_mask:
+        exact_log_softmax = True
+
+    if _FUSED_CROSS_ENTROPY is not None and logits.is_cuda and not exact_log_softmax:
         # Fused path: one Triton kernel over the full (total_tokens, V) buffer,
         # with the backward writing dlogits in place. Never materializes a
         # log_softmax tensor, and the boundary rows are dropped *after* the
@@ -253,8 +295,12 @@ def packed_token_log_probs(
     for start in range(0, shifted_logits.shape[0], chunk_size):
         end = min(start + chunk_size, shifted_logits.shape[0])
         z = shifted_logits[start:end]
+        if exact_log_softmax:
+            z = z.float()
         if temperature != 1.0:
             z = z / temperature
+        if vocab_mask:
+            z = _mask_vocab_tail(z)
         row_lp = F.log_softmax(z, dim=-1)
         lp_parts.append(
             row_lp.gather(-1, shifted_targets[start:end]).squeeze(-1)
@@ -304,6 +350,11 @@ def packed_token_entropy(
             z = z.float()
         if temperature != 1.0:
             z = z / temperature
+        # Drop the padded tail instead of filling -inf. Those columns have
+        # probability 0, and ``0 * -inf`` would turn the entropy into NaN.
+        width = _vocab_mask_width(z.shape[-1])
+        if width:
+            z = z[..., :width]
         lse = torch.logsumexp(z, dim=-1)
         probs = torch.softmax(z, dim=-1)
         ent = lse - (probs * z).sum(dim=-1)
@@ -360,6 +411,112 @@ def unpack_log_probs(
 _original_attn_fn = None  # saved reference to the previous sdpa function
 
 
+_row_meta_cache: tuple | None = None
+
+
+def _packed_rows(cu_seqlens: torch.Tensor, total: int):
+    """Row starts and lengths for ``cu_seqlens``, shared by all layers of a forward."""
+    global _row_meta_cache
+    from lumenrl.aiter_patch.qlen1_attention import packed_causal_rows
+
+    cached = _row_meta_cache
+    if cached is not None and cached[0] is cu_seqlens and cached[1] == total:
+        return cached[2]
+    rows = packed_causal_rows(cu_seqlens, total)
+    # Holding the tensor keeps its id unique while it is the cache key.
+    _row_meta_cache = (cu_seqlens, total, rows)
+    return rows
+
+
+class _RowwiseAttention(torch.autograd.Function):
+    """q_len=1 attention values with the gradient of ordinary causal attention.
+
+    The forward is the decode-shaped call that matches ATOM bit for bit. Its
+    backward recomputes the full-sequence causal varlen attention and
+    differentiates that. Both compute the same function, so the gradient is
+    the attention gradient up to rounding; only the forward values are
+    required to be bitwise.
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, cu_seqlens, max_seqlen, softmax_scale):
+        from lumenrl.aiter_patch.qlen1_attention import row_prefix_attention
+
+        starts, lens = _packed_rows(cu_seqlens, q.shape[0])
+        out = row_prefix_attention(q, k, v, starts, lens, max_seqlen, softmax_scale)
+        ctx.save_for_backward(q, k, v, cu_seqlens)
+        ctx.max_seqlen = max_seqlen
+        ctx.softmax_scale = softmax_scale
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        from aiter import flash_attn_varlen_func
+
+        q, k, v, cu_seqlens = ctx.saved_tensors
+        with torch.enable_grad():
+            q_ = q.detach().requires_grad_()
+            k_ = k.detach().requires_grad_()
+            v_ = v.detach().requires_grad_()
+            result = flash_attn_varlen_func(
+                q_, k_, v_,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=ctx.max_seqlen,
+                max_seqlen_k=ctx.max_seqlen,
+                dropout_p=0.0,
+                softmax_scale=ctx.softmax_scale,
+                causal=True,
+                return_lse=True,
+            )
+            out = result[0] if isinstance(result, tuple) else result
+            torch.autograd.backward(out, grad_out)
+        return q_.grad, k_.grad, v_.grad, None, None, None
+
+
+def _rowwise_varlen_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    softmax_scale: float,
+    needs_grad: bool,
+) -> torch.Tensor:
+    """Evaluate packed causal attention with ATOM decode's q_len=1 arithmetic.
+
+    Every token is one query row over its own KV prefix, the reduction ATOM
+    decode runs. All rows go through one launch per layer
+    (``lumenrl.aiter_patch.qlen1_attention``).
+    """
+    if needs_grad:
+        return _RowwiseAttention.apply(q, k, v, cu_seqlens, max_seqlen, softmax_scale)
+    from lumenrl.aiter_patch.qlen1_attention import row_prefix_attention
+
+    starts, lens = _packed_rows(cu_seqlens, q.shape[0])
+    return row_prefix_attention(q, k, v, starts, lens, max_seqlen, softmax_scale)
+
+
+_rowwise_dropout_warned = False
+
+
+def _use_rowwise_attention(dropout: float) -> bool:
+    """q_len=1 training attention is only the dropout-free specialization."""
+    global _rowwise_dropout_warned
+    if os.environ.get("LUMENRL_ROWWISE_TRAIN_ATTN", "0") != "1":
+        return False
+    if dropout == 0.0:
+        return True
+    if not _rowwise_dropout_warned:
+        _rowwise_dropout_warned = True
+        logger.warning(
+            "LUMENRL_ROWWISE_TRAIN_ATTN=1 is ignored because attention dropout is %s. "
+            "q_len=1 alignment requires dropout 0.",
+            dropout,
+        )
+    return False
+
+
 def _varlen_attention_forward(
     module: torch.nn.Module,
     query: torch.Tensor,
@@ -403,19 +560,23 @@ def _varlen_attention_forward(
         t.requires_grad for t in [q, k, v]
     )
 
-    result = flash_attn_varlen_func(
-        q, k, v,
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_k=cu_seqlens,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_k=max_seqlen,
-        dropout_p=dropout,
-        softmax_scale=softmax_scale,
-        causal=True,
-        return_lse=needs_grad,
-    )
-
-    attn_output = result[0] if isinstance(result, tuple) else result
+    if _use_rowwise_attention(dropout):
+        attn_output = _rowwise_varlen_attention(
+            q, k, v, cu_seqlens, max_seqlen, softmax_scale, needs_grad
+        )
+    else:
+        result = flash_attn_varlen_func(
+            q, k, v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            dropout_p=dropout,
+            softmax_scale=softmax_scale,
+            causal=True,
+            return_lse=needs_grad,
+        )
+        attn_output = result[0] if isinstance(result, tuple) else result
     # Reshape back to (B, S, H_q, D) for HF
     attn_output = attn_output.view(B_dim, S_dim, H_q, D).contiguous()
     return attn_output, None
@@ -437,8 +598,17 @@ def patch_attention_for_packing() -> bool:
         logger.warning("Cannot import ALL_ATTENTION_FUNCTIONS; packing attention patch skipped.")
         return False
 
-    # Save the current sdpa function (should be Lumen's _lumen_aiter_attention_forward)
-    _original_attn_fn = ALL_ATTENTION_FUNCTIONS.get("sdpa")
+    # Save the current sdpa function (should be Lumen's
+    # _lumen_aiter_attention_forward). Actor and frozen-reference workers can
+    # share a process through an ActorRefFusedWorker, so initialization reaches
+    # this function twice. Do not capture this wrapper as its own fallback on
+    # the second call: the reference's non-packed forward would recurse forever.
+    current_attn_fn = ALL_ATTENTION_FUNCTIONS.get("sdpa")
+    if current_attn_fn is _varlen_attention_forward:
+        logger.info("Packing: HF sdpa attention already uses the varlen patch.")
+        return True
+
+    _original_attn_fn = current_attn_fn
     if _original_attn_fn is None:
         logger.warning("No 'sdpa' attention function registered; packing patch skipped.")
         return False
