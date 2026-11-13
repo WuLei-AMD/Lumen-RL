@@ -389,7 +389,8 @@ def _apply_lumen_fp8(model: nn.Module, quant_config: dict[str, Any]) -> nn.Modul
         # (vocab ~152k x hidden 4096) -> garbage logits -> exploding grad_norm /
         # near-zero entropy / policy collapse. Keep every other Linear in FP8 but
         # run lm_head in BF16. Only relevant when FP8 quantized linear is active.
-        if fp8_enabled:
+        # Rollout=ATOM already keeps lm_head on the BF16 TunedGemm that ATOM runs.
+        if fp8_enabled and str(lumen_rollout).upper() != "ATOM":
             import torch.nn as nn
 
             restored = 0

@@ -591,6 +591,39 @@ def decode_split_attention(q, k_pool, v_pool, plan, softmax_scale, pending=None)
     return out
 
 
+def decode_static_attention(q, k_new, v_new, k_pool, v_pool, st, softmax_scale):
+    """``decode_split_attention`` with a launch shape fixed by ``q.shape[0]``.
+
+    Every decode row owns ``st["width"]`` grouped entries, so a step of
+    ``rows`` rows always launches ``rows * width`` entries and every index
+    lives in the buffers of ``st`` (filled on the host before the step). A
+    CUDA graph captured once per batch size then replays any step. Entries a
+    row does not need read one scratch key and are never merged. A row of at
+    most ``SPLIT_KEYS`` keys is one entry merged alone, which returns its
+    partial unchanged. ``k_new``/``v_new`` are the step's K/V rows, written to
+    the pool rows ``st["write_dst"]`` in the launch that groups the queries.
+    """
+    rows, hq, dim = q.shape
+    hk = k_pool.shape[1]
+    rep = hq // hk
+    entries = rows * st["width"]
+    if not (q.stride(2) == 1 and q.stride(1) == dim):
+        q = q.contiguous()
+    grouped = pool_write_group_queries(
+        k_new, v_new, st["write_dst"][:rows], k_pool, v_pool, q, st["gather"][:entries], hk
+    )
+    o, lse = _varlen_fwd(
+        grouped, k_pool, v_pool, st["cu_q"][: entries + 1], st["cu_k"][: entries + 1],
+        rep, SPLIT_KEYS, softmax_scale, False, k_padded=st["k_start"][: entries + 1],
+    )
+    out = torch.empty_like(q)
+    _merge_partials(
+        o, lse, (rep * hk * dim, dim, hk * dim), (rep, lse.stride(0), 1),
+        st["idx"][:rows], st["npart"][:rows], st["dst"][:rows], out, rep,
+    )
+    return out
+
+
 def packed_causal_rows(cu_seqlens, total):
     """Row starts and lengths of causal attention over packed sequences.
 

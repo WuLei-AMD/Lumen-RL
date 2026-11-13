@@ -373,28 +373,200 @@ def _attn_tensors(device, rep, pool_rows, hq):
     return tensors
 
 
+def _pool_slots() -> int:
+    return int(os.environ.get("LUMENRL_ALIGN_POOL_SLOTS", "8") or 8)
+
+
 def _pool(module, like):
-    """This layer's K/V pool, grown to hold every assigned slot."""
-    cap = _plan["cap"]
-    pool = getattr(module, "_lumenrl_pool", None)
-    if pool is not None and (pool[0].shape[1:] != like.shape[1:] or pool[0].dtype != like.dtype):
+    """This layer's K/V pool: ``_pool_slots()`` sequence slots plus one scratch slot.
+
+    Allocated once at full size. A CUDA graph holds the pool's address, so
+    it never grows; a step that needs more slots than that is an error.
+    """
+    cap = _cap()
+    slots = _pool_slots()
+    if _num_slots > slots:
         raise RuntimeError(
-            f"batched decode: K/V {tuple(like.shape[1:])} {like.dtype} does not match "
-            f"pool {tuple(pool[0].shape[1:])} {pool[0].dtype}"
+            f"batched decode: {_num_slots} concurrent sequences exceed "
+            f"LUMENRL_ALIGN_POOL_SLOTS={slots}"
         )
-    if pool is not None and pool[0].shape[0] >= _num_slots * cap:
-        return pool
-    slots = (max(_num_slots, 1) + 7) // 8 * 8
-    k = torch.empty((slots * cap, *like.shape[1:]), dtype=like.dtype, device=like.device)
-    v = torch.empty_like(k)
+    pool = getattr(module, "_lumenrl_pool", None)
     if pool is not None:
-        k[: pool[0].shape[0]].copy_(pool[0])
-        v[: pool[1].shape[0]].copy_(pool[1])
+        if pool[0].shape[1:] != like.shape[1:] or pool[0].dtype != like.dtype:
+            raise RuntimeError(
+                f"batched decode: K/V {tuple(like.shape[1:])} {like.dtype} does not match "
+                f"pool {tuple(pool[0].shape[1:])} {pool[0].dtype}"
+            )
+        return pool
+    k = torch.zeros(((slots + 1) * cap, *like.shape[1:]), dtype=like.dtype, device=like.device)
+    v = torch.zeros_like(k)
     module._lumenrl_pool = (k, v)
     return module._lumenrl_pool
 
 
+# Index buffers of decode_static_attention, at fixed addresses for CUDA graphs.
+_static = None
+
+
+def _cap() -> int:
+    """Slot capacity from the engine config, so capture and later steps agree."""
+    global _capacity
+    try:
+        from atom.config import get_current_atom_config
+
+        _capacity = _configured_capacity(get_current_atom_config())
+    except Exception:
+        pass
+    return _capacity
+
+
+def _static_rows() -> int:
+    """Largest decode batch: every captured graph size is at most max_num_seqs."""
+    try:
+        from atom.config import get_current_atom_config
+
+        return int(get_current_atom_config().max_num_seqs)
+    except Exception:
+        return int(os.environ.get("LUMENRL_ALIGN_STATIC_ROWS", "64"))
+
+
+def _static_buffers(device, rep):
+    global _static
+    if _static is not None:
+        return _static
+    qa = _qlen1()
+    rows = _static_rows()
+    cap = _cap()
+    width = -(-cap // qa.SPLIT_KEYS)
+    entries = rows * width
+    if entries + 1 + rows > cap:
+        raise RuntimeError(f"batched decode: scratch slot of {cap} rows cannot hold {entries} entries")
+    i32 = dict(dtype=torch.int32, device=device)
+    _static = {
+        "rows": rows,
+        "width": width,
+        "rep": rep,
+        "scratch": _pool_slots() * cap,
+        "write_dst": torch.zeros(rows, dtype=torch.long, device=device),
+        "gather": torch.zeros(entries, dtype=torch.long, device=device),
+        "cu_q": torch.arange(0, rep * (entries + 1), rep, **i32),
+        "cu_k": torch.zeros(entries + 1, **i32),
+        "k_start": torch.zeros(entries + 1, **i32),
+        "idx": torch.zeros((rows, width), **i32),
+        "npart": torch.zeros(rows, **i32),
+        "dst": torch.arange(rows, **i32),
+    }
+    _fill_static(None)
+    return _static
+
+
+def _static_lists(row_starts, row_lens, order, rows, width, scratch, split):
+    """Host contents of the decode_static_attention buffers.
+
+    ``row_starts[i]``/``row_lens[i]`` are pool start and key count of real
+    row ``i``; ``order`` lists the real rows by pool start, so entry starts
+    stay non-decreasing. Rows past the real ones and entries past the real
+    ones read scratch rows; each padded row merges one padded entry.
+    """
+    n = len(row_lens)
+    entries = rows * width
+    write_dst = [row_starts[i] + row_lens[i] - 1 for i in range(n)] + [scratch + i for i in range(n, rows)]
+    gather, k_start, k_len = [], [], []
+    idx = [[0] * width for _ in range(rows)]
+    npart = [1] * rows
+    for i in order:
+        parts = 0
+        for p in range(0, row_lens[i], split):
+            idx[i][parts] = len(gather)
+            parts += 1
+            gather.append(i)
+            k_start.append(row_starts[i] + p)
+            k_len.append(min(split, row_lens[i] - p))
+        if parts > width:
+            raise RuntimeError(f"batched decode: row of {row_lens[i]} keys needs {parts} > {width} blocks")
+        npart[i] = parts
+    real = len(gather)
+    for i in range(n, rows):
+        idx[i][0] = real + (i - n)
+    for e in range(real, entries):
+        gather.append(0)
+        k_start.append(scratch + (e - real))
+        k_len.append(1)
+    k_start.append(scratch + (entries - real))
+    cu_k = [0]
+    for x in k_len:
+        cu_k.append(cu_k[-1] + x)
+    flat_idx = [x for row in idx for x in row]
+    return write_dst, gather, cu_k, k_start, flat_idx, npart
+
+
+def _fill_static(plan):
+    """Upload this step's decode indices (or all-padding) into ``_static``."""
+    st = _static
+    if st is None:
+        return
+    if plan is None:
+        starts, lens, order = [], [], []
+    else:
+        lens = [int(x) for x in plan["lens"]]
+        starts = [int(x) for x in plan["starts"]]
+        perm = plan["perm"] if plan["perm"] is not None else list(range(len(lens)))
+        # plan["starts"]/["lens"] are listed in perm order; map them back to rows.
+        row_starts = [0] * len(lens)
+        row_lens = [0] * len(lens)
+        for pos, row in enumerate(perm):
+            row_starts[row] = starts[pos]
+            row_lens[row] = lens[pos]
+        starts, lens = row_starts, row_lens
+        order = list(perm)
+    write_dst, gather, cu_k, k_start, idx, npart = _static_lists(
+        starts, lens, order, st["rows"], st["width"], st["scratch"], _qlen1().SPLIT_KEYS
+    )
+    device = st["gather"].device
+    entries, rep = len(gather), st["rep"]
+    # cu_q and dst never change, but are uploaded too: sleep mode may drop
+    # device memory between steps.
+    cu_q = list(range(0, rep * (entries + 1), rep))
+    longs = _to_device([write_dst, gather], torch.long, device)
+    ints = _to_device([cu_k, k_start, idx, npart, cu_q, list(range(st["rows"]))], torch.int32, device)
+    st["write_dst"].copy_(longs[0], non_blocking=True)
+    st["gather"].copy_(longs[1], non_blocking=True)
+    st["cu_k"].copy_(ints[0], non_blocking=True)
+    st["k_start"].copy_(ints[1], non_blocking=True)
+    st["idx"].view(-1).copy_(ints[2], non_blocking=True)
+    st["npart"].copy_(ints[3], non_blocking=True)
+    st["cu_q"].copy_(ints[4], non_blocking=True)
+    st["dst"].copy_(ints[5], non_blocking=True)
+    if plan is not None:
+        plan["static"] = True
+
+
+def _static_step(plan) -> bool:
+    """A decode step that decode_static_attention can run: one new row per sequence."""
+    return (
+        plan is not None
+        and plan["complete"]
+        and plan["rows"] == len(plan["slots"])
+        and plan["rows"] <= (_static["rows"] if _static is not None else _static_rows())
+    )
+
+
 _qa = None
+
+
+def _static_decode(impl, fwd_ctx, rows) -> bool:
+    """Decode through decode_static_attention, the CUDA-graph-capturable path.
+
+    Without a plan this is a graph capture or a dummy step: every row is padding.
+    """
+    return (
+        _flag("LUMENRL_ALIGN_STATIC_DECODE")
+        and not _history_blocked(fwd_ctx)
+        and impl.sinks is None
+        and impl.sliding_window <= 0
+        and rows <= (_static["rows"] if _static is not None else _static_rows())
+        and (_plan is None or (_static_step(_plan) and rows >= _plan["rows"]))
+    )
 
 
 def _qlen1():
@@ -539,6 +711,12 @@ def _patch_runner_kv_plan(module):
         _publish_step(self, batch)
         if _batched():
             _plan_step()
+            # A replayed graph runs no Python, so its indices are uploaded here.
+            if _static is not None and _flag("LUMENRL_ALIGN_STATIC_DECODE"):
+                if _plan is None:
+                    _fill_static(None)
+                elif _static_step(_plan):
+                    _fill_static(_plan)
         return orig_prepare(self, batch, *args, **kwargs)
 
     def run_model(self, *args, **kwargs):
@@ -748,7 +926,10 @@ def patch_attention(module):
         if align and _flag("LUMENRL_ALIGN_CONTIG_KV"):
             _drop_retired(self)
             if _batched():
-                if _plan is not None:
+                if not prefill and _static_decode(self, fwd_ctx, q.shape[0]):
+                    _q_out, k_out, v_out, *_ = result
+                    self._lumenrl_static_kv = (k_out, v_out)
+                elif _plan is not None:
                     if _history_blocked(fwd_ctx):
                         _plan["blocked"] = True
                     else:
@@ -760,6 +941,17 @@ def patch_attention(module):
         return result
 
     def paged_attention_varlen(self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx):
+        static_kv = self.__dict__.get("_lumenrl_static_kv")
+        if static_kv is not None:
+            self._lumenrl_static_kv = None
+            k_pool, v_pool = _pool(self, static_kv[0])
+            st = _static_buffers(q.device, q.shape[1] // k_pool.shape[1])
+            if _plan is not None and not _plan.get("static"):
+                _fill_static(_plan)
+            return _qlen1().decode_static_attention(
+                q, static_kv[0], static_kv[1], k_pool, v_pool, st, self.scale
+            )
+
         meta = fwd_ctx.attn_metadata
         sliding = (self.sliding_window, 0, 0) if self.sliding_window > 0 else (-1, -1, 0)
 

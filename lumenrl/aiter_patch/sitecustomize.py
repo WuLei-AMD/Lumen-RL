@@ -119,6 +119,68 @@ def _install_weight_sync_fence():
 if os.environ.get("LUMENRL_ALIGN_SYNC_WEIGHTS") == "1":
     _install_weight_sync_fence()
 
+
+def _install_fp8_decode_gemm_config():
+    """Decode-M tile for the Triton blockscale GEMM of the Qwen3-8B linears.
+
+    The default M<=8 tile (BLOCK_N=32) launches N/32 programs, fewer than the
+    CUs for N=4096. BLOCK_N=16 doubles them and is ~1.24x faster at M=1. Every
+    tile here keeps NUM_KSPLIT=1 and BLOCK_K=128, so each output row is the
+    same sum in the same order: rows at M<=8 equal the rows training gets at
+    any M (fp8_probe/gemm_tune_probe.py: all 288 tiles of the sweep).
+    """
+    shapes = {(6144, 4096), (4096, 4096), (24576, 4096), (4096, 12288)}
+    tile = {
+        "BLOCK_SIZE_M": 8, "BLOCK_SIZE_N": 16, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1,
+        "num_warps": 1, "num_stages": 3, "waves_per_eu": 2, "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg", "NUM_KSPLIT": 1,
+    }
+    target = "aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale"
+
+    def _wrap(module):
+        current = module._get_config
+        if getattr(current, "_lumenrl_decode_tile", False):
+            return
+
+        def _get_config(M, N, K, *args, **kwargs):
+            shuffle = args[0] if args else kwargs.get("shuffle", False)
+            if M <= 8 and not shuffle and (N, K) in shapes:
+                return dict(tile), True
+            return current(M, N, K, *args, **kwargs)
+
+        _get_config._lumenrl_decode_tile = True
+        module._get_config = _get_config
+
+    if target in sys.modules:
+        _wrap(sys.modules[target])
+        return
+
+    class _Finder:
+        def find_spec(self, fullname, path, target_=None):
+            if fullname != target:
+                return None
+            sys.meta_path.remove(self)
+            try:
+                spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+            finally:
+                sys.meta_path.insert(0, self)
+            if spec is None or spec.loader is None:
+                return spec
+            orig_exec = spec.loader.exec_module
+
+            def exec_module(module, _orig=orig_exec):
+                _orig(module)
+                _wrap(module)
+
+            spec.loader.exec_module = exec_module
+            return spec
+
+    sys.meta_path.insert(0, _Finder())
+
+
+if os.environ.get("LUMENRL_FP8_DECODE_GEMM", "0") == "1":
+    _install_fp8_decode_gemm_config()
+
 if os.environ.get("LUMENRL_PREFILL_RESCORE", "0") == "1":
     from prefill_rescore import install as _install_prefill_rescore
 
