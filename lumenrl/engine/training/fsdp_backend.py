@@ -250,6 +250,17 @@ def _load_hf_model(model_name: str, torch_dtype: torch.dtype = torch.bfloat16) -
     # lumenrl/engine/inference/vllm_colocate_worker_ext.py.
     enable_fp32_moe_router(model)
 
+    # MoE only: run the fused HF experts as one SonicMoE grouped GEMM pair.
+    # The gate is untouched, so the router patch above still applies. Weight
+    # export maps the Sonic layout back to HF names (fsdp_engine).
+    if os.environ.get("LUMENRL_SONIC_MOE", "0") == "1":
+        from lumen.modules.sonic_hf_experts import replace_hf_moe_experts
+
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        replaced = replace_hf_moe_experts(model, device=torch.device(f"cuda:{local_rank}"))
+        # print, not logger: Ray actors swallow library-level log records.
+        print(f"[lumenrl] SonicMoE experts on {replaced} MoE blocks (rank {rank})", flush=True)
+
     logger.info("[rank %d] Model ready: %s (%d params)", rank, model_name, sum(p.numel() for p in model.parameters()))
     return model
 

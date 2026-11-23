@@ -561,6 +561,32 @@ class LumenActorWorker(BaseWorker):
                             if want_entropy:
                                 ent_parts.append(token_ent)
                         del outputs, logits
+                        # Every rank repeats every chunk the same number of times,
+                        # so the FSDP2 all-gathers stay in lockstep.
+                        for rep in range(int(os.environ.get("LUMENRL_OLDLP_REPEAT", "0") or 0)):
+                            again = module(
+                                input_ids=packed.input_ids,
+                                position_ids=packed.position_ids,
+                                attention_mask=None,
+                                use_cache=False,
+                            )
+                            again = again.logits if hasattr(again, "logits") else again
+                            again_lp = packed_token_log_probs(
+                                again.squeeze(0), packed.input_ids.squeeze(0), packed.cu_seqlens,
+                                temperature=temperature,
+                            )
+                            del again
+                            neq = (again_lp != flat_lp).nonzero().flatten()
+                            if neq.numel() and i < n_rows:
+                                cu = packed.cu_seqlens.tolist()
+                                seqs = sorted({next(s for s in range(len(cu) - 1) if cu[s] <= int(p) < cu[s + 1]) for p in neq.tolist()})
+                                print(
+                                    f"lumenrl oldlp repeat rank={self.rank} chunk={i}/{n_rows} rep={rep} "
+                                    f"ndiff={neq.numel()} first={int(neq[0])} tokens={cu[-1]} "
+                                    f"seqs={seqs} seq_lens={packed.seq_lens.tolist()} "
+                                    f"maxabs={float((again_lp - flat_lp).abs().max()):.3g}",
+                                    flush=True,
+                                )
 
         log_probs = torch.cat(lp_parts, dim=0)
         tensors = {"log_probs": log_probs.cpu(), "input_ids": batch["input_ids"]}
@@ -995,7 +1021,46 @@ class LumenActorWorker(BaseWorker):
                     out_metrics["rollout_corr_kl_sum"] = float(delta.sum())
                     out_metrics["rollout_corr_kl_tok"] = tok
                     out_metrics.update(self._mismatch_metrics(delta, mask, tok))
+                    if os.environ.get("LUMENRL_MISMATCH_TRACE") == "1":
+                        self._trace_mismatch(delta, mask, rlp, token_log_probs, data)
         return loss, out_metrics
+
+    def _trace_mismatch(self, delta, mask, rlp, token_log_probs, data) -> None:
+        """Print the first nonzero train/rollout deltas with their positions."""
+        hits = (delta != 0).nonzero().tolist()
+        if not hits:
+            return
+        lens = mask.sum(dim=-1).long().tolist()
+        ids = data.get("input_ids")
+        dump_dir = os.environ.get("LUMENRL_MISMATCH_DUMP_DIR")
+        if dump_dir:
+            os.makedirs(dump_dir, exist_ok=True)
+            self._mismatch_dumps = getattr(self, "_mismatch_dumps", 0) + 1
+            # The whole micro-batch, so a replay packs the same rows together.
+            rows = list(range(delta.shape[0]))
+            torch.save(
+                {
+                    "rows": rows,
+                    "hits": hits,
+                    "tensors": {
+                        k: v.detach().cpu()
+                        for k, v in data.items()
+                        if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == delta.shape[0]
+                    },
+                    "mask": mask.detach().cpu(),
+                    "rollout": rlp.detach().cpu(),
+                    "train": token_log_probs.detach().cpu(),
+                },
+                os.path.join(dump_dir, f"rank{self.rank}-call{self._mismatch_dumps}.pt"),
+            )
+        for b, t in hits[:32]:
+            tok_id = int(ids[b, t + 1]) if ids is not None and t + 1 < ids.shape[-1] else -1
+            print(
+                f"lumenrl mismatch rank={self.rank} row={b} pos={t} resp_len={lens[b]} "
+                f"width={delta.shape[-1]} token={tok_id} rollout={float(rlp[b, t]):.9g} "
+                f"train={float(token_log_probs[b, t]):.9g}",
+                flush=True,
+            )
 
     @staticmethod
     def _mismatch_metrics(delta, mask, tok: float) -> dict[str, float]:

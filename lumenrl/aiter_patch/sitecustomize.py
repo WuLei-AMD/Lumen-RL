@@ -42,6 +42,11 @@ def _install_prefill_rope():
 
 _install_prefill_rope()
 
+if os.environ.get("LUMENRL_ALIGN_MOE", "0") == "1":
+    from align_moe import install as _install_align_moe
+
+    _install_align_moe()
+
 
 def _install_topk_select_shim():
     """Let a newer ATOM import on an aiter build that has no ``topk_select``.
@@ -183,6 +188,54 @@ def _install_weight_sync_fence():
         crc = zlib.crc32(sample.cpu().numpy().tobytes()) & 0xFFFFFFFF
         return f"crc={crc:08x} numel={param.numel()}"
 
+    audit = os.environ.get("LUMENRL_ALIGN_WEIGHT_AUDIT") == "1"
+
+    def _checksums(model):
+        import torch
+
+        sums = {}
+        for name, param in model.named_parameters():
+            flat = param.detach().reshape(-1).view(torch.int16)
+            h1 = torch.zeros((), dtype=torch.int64, device=flat.device)
+            h2 = torch.zeros((), dtype=torch.int64, device=flat.device)
+            step = 1 << 26
+            for start in range(0, flat.numel(), step):
+                chunk = flat[start:start + step].to(torch.int64)
+                pos = torch.arange(start, start + chunk.numel(), device=flat.device) % 65521 + 1
+                h1 += chunk.sum()
+                h2 += (chunk * pos).sum()
+            sums[name] = (int(h1), int(h2), tuple(param.shape))
+        return sums
+
+    def _audit(runner, when):
+        model = getattr(runner, "model", None)
+        if model is None:
+            return
+        now = _checksums(model)
+        ref = getattr(runner, "_lumenrl_weight_audit", None)
+        if ref is None:
+            runner._lumenrl_weight_audit = now
+            print(f"lumenrl weight audit {when}: recorded {len(now)} params", flush=True)
+            return
+        bad = [n for n in ref if now.get(n) != ref[n]]
+        print(f"lumenrl weight audit {when}: {len(bad)}/{len(ref)} params differ from load", flush=True)
+        for n in bad[:40]:
+            print(f"lumenrl weight audit differ {n} ref={ref[n]} now={now.get(n)}", flush=True)
+
+    def _wrap_memory(module):
+        cls = module.MemoryManagerMixin
+        current = cls._release_weights
+        if getattr(current, "_lumenrl_audited", False):
+            return
+
+        def release(self):
+            if getattr(self, "_lumenrl_weight_audit", None) is None and not getattr(self, "_weights_discarded", False):
+                _audit(self, "before first release")
+            return current(self)
+
+        release._lumenrl_audited = True
+        cls._release_weights = release
+
     def _wrap(module):
         cls = module.WeightUpdaterMixin
         current = cls.update_weights_from_ipc
@@ -204,13 +257,15 @@ def _install_weight_sync_fence():
                     f"{fingerprint}",
                     flush=True,
                 )
+                if audit:
+                    _audit(self, "after sync")
             return updated
         wrapped._lumenrl_fenced = True
         cls.update_weights_from_ipc = wrapped
 
     class _Finder:
         def find_spec(self, fullname, path, target=None):
-            if fullname != "atom.rollout.weight_updater":
+            if fullname not in ("atom.rollout.weight_updater", "atom.rollout.memory_manager"):
                 return None
             sys.meta_path.remove(self)
             try:
@@ -221,9 +276,12 @@ def _install_weight_sync_fence():
                 return spec
             orig_exec = spec.loader.exec_module
 
-            def exec_module(module, _orig=orig_exec):
+            def exec_module(module, _orig=orig_exec, _name=fullname):
                 _orig(module)
-                _wrap(module)
+                if _name == "atom.rollout.weight_updater":
+                    _wrap(module)
+                elif audit:
+                    _wrap_memory(module)
 
             spec.loader.exec_module = exec_module
             return spec
