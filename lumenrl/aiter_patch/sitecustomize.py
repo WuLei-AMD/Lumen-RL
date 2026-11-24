@@ -42,7 +42,7 @@ def _install_prefill_rope():
 
 _install_prefill_rope()
 
-if os.environ.get("LUMENRL_ALIGN_MOE", "0") == "1":
+if os.environ.get("LUMENRL_BATCH_INVARIANT_MOE", "0") == "1":
     from align_moe import install as _install_align_moe
 
     _install_align_moe()

@@ -34,7 +34,7 @@ import os
 import torch
 import torch.nn.functional as F
 
-from lumenrl.moe.rollout_routing import apply_replay, layer_index_of
+from lumenrl.moe.rollout_routing import apply_replay, layer_index_of, replay_installed
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +103,12 @@ def _patch_hf_topk_router(mod: torch.nn.Module, layer_idx: int | None, fp32: boo
 
         tuned_linear = make_tuned_linear_fn(TunedGemm())
 
-    def forward(hidden_states, _m=mod, _layer=layer_idx, _fp32=fp32, _tuned=tuned_linear):
+    # LUMENRL_BATCH_INVARIANT_MOE=1: top-k with the fused kernel ATOM's batch-invariant MoE path runs on its logits.
+    batch_invariant_route = None
+    if os.environ.get("LUMENRL_BATCH_INVARIANT_MOE", "0") == "1":
+        from lumenrl.moe.batch_invariant_experts import fused_route as batch_invariant_route
+
+    def forward(hidden_states, _m=mod, _layer=layer_idx, _fp32=fp32, _tuned=tuned_linear, _bi=batch_invariant_route):
         out_dtype = _m.weight.dtype
         hidden_states = hidden_states.reshape(-1, _m.hidden_dim)
         if _fp32:
@@ -112,6 +117,9 @@ def _patch_hf_topk_router(mod: torch.nn.Module, layer_idx: int | None, fp32: boo
             router_logits = _tuned.apply(hidden_states, _m.weight, None, False)
         else:
             router_logits = F.linear(hidden_states, _m.weight)
+        if _bi is not None and not replay_installed():
+            weights, indices, _ = _bi(router_logits, _m.top_k, bool(_m.norm_topk_prob))
+            return router_logits.to(out_dtype), weights.to(out_dtype), indices
         router_probs = F.softmax(router_logits, dtype=torch.float, dim=-1)
         router_top_value, router_indices = torch.topk(router_probs, _m.top_k, dim=-1)
 

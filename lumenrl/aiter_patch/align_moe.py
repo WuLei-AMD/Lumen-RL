@@ -1,36 +1,23 @@
-"""Run ATOM's BF16 routed experts on the trainer's SonicMoE path.
+"""Run ATOM's BF16 routed experts on the deterministic expanded path (LUMENRL_BATCH_INVARIANT_MOE=1).
 
 aiter ``fused_moe`` (2-stage CK) accumulates expert outputs with atomics, so
 one input run twice differs by up to 6e-2, and a token's output changes with
-the batch around it. No trainer can match that. With ``LUMENRL_ALIGN_MOE=1``
-the unquantized FusedMoE instead runs Lumen's ``sonic_experts_forward``, the
-function the trainer's ``SonicHFExperts`` calls (``LUMENRL_SONIC_MOE=1``),
-which is deterministic and independent of the token count. Routing is the HF
-Qwen3-MoE router math on ATOM's gate logits: fp32 softmax, top-k, renormalize,
-cast to the logits dtype. ``topk_softmax`` picks the same experts in a
-different order, and the reduction runs in that order.
-
-The expert buffers keep their shape, so ATOM's loader and weight updater still
-match parameters by shape. Their bytes are Sonic's layout: ``w13_weight``
-(E, 2I, H) holds ``w1`` (E, H, 2I) and ``w2_weight`` (E, H, I) holds ``w2``
-(E, I, H). That conversion replaces aiter's shuffle both after the initial
-load and in the updater's per-expert relayout.
+the batch around it. The patched unquantized FusedMoE instead runs the experts
+on expanded rows with a fixed-order reduce (``lumenrl.moe.batch_invariant_experts``), on
+ATOM's stock shuffled weights. Routing is ``fused_route_expand``, the kernel the
+trainer's router runs in the same mode, so ids and weights match bit for bit.
 """
 
 import importlib.machinery
 import sys
 
-_SONIC_ATTR = "_lumen_sonic_layout"
-
 
 def install():
+    """Install the deterministic BF16 MoE patch on ATOM's unquantized FusedMoE."""
     if getattr(sys, "_lumenrl_align_moe_installed", False):
         return
     sys._lumenrl_align_moe_installed = True
-    patchers = {
-        "atom.model_ops.moe": _patch_moe,
-        "atom.model_ops.utils": _patch_utils,
-    }
+    patchers = {"atom.model_ops.moe": _patch_moe_batch_invariant}
 
     class _Finder:
         def find_spec(self, fullname, path, target=None):
@@ -56,66 +43,66 @@ def install():
     sys.meta_path.insert(0, _Finder())
 
 
-def _to_sonic(param, kind, expert_ids):
-    from lumen.modules.sonic_hf_experts import down_to_sonic_, gate_up_to_sonic_
+def _patch_moe_batch_invariant(module):
+    """LUMENRL_BATCH_INVARIANT_MOE=1: ATOM's stock shuffled weights, deterministic experts.
 
-    convert = gate_up_to_sonic_ if kind == "w13" else down_to_sonic_
-    convert(param.data, expert_ids)
-    setattr(param, _SONIC_ATTR, kind)
+    Experts are ``lumenrl.moe.batch_invariant_experts.batch_invariant_experts_core`` (the kernel the trainer's
+    ``BatchInvariantHFExperts`` runs in forward). Routing is ``fused_route_expand``, the kernel the
+    trainer's router runs in the same mode, so ids and weights match the trainer bit for bit.
+    """
+    from aiter import ActivationType
 
-
-def _patch_utils(module):
-    orig = module.shuffle_expert_slices
-
-    def shuffle_expert_slices(tensor, expert_ids, layout=(16, 16)):
-        kind = getattr(tensor, _SONIC_ATTR, None)
-        if kind is None:
-            return orig(tensor, expert_ids, layout)
-        _to_sonic(tensor, kind, list(expert_ids))
-
-    module.shuffle_expert_slices = shuffle_expert_slices
-
-
-def _patch_moe(module):
-    import torch
-    import torch.nn.functional as F
+    from lumenrl.moe.batch_invariant_experts import batch_invariant_experts_core, fused_route_expand
 
     method = module.UnquantizedFusedMoEMethod
-    orig_process = method.process_weights_after_loading
+    orig_apply = method.apply
 
-    def process_weights_after_loading(self, layer):
-        def to_sonic(w13, w2, layout=(16, 16)):
-            _to_sonic(w13, "w13", range(w13.shape[0]))
-            _to_sonic(w2, "w2", range(w2.shape[0]))
-
-        orig_shuffle = module.shuffle_weights
-        module.shuffle_weights = to_sonic
-        try:
-            orig_process(self, layer)
-        finally:
-            module.shuffle_weights = orig_shuffle
-
-    def apply(self, layer, x, router_logits, top_k, renormalize, *args, **kwargs):
-        from lumen.modules.sonic_hf_experts import sonic_experts_forward
-        from lumen.ops.moe.sonic_configs import install_qwen3_sonic_configs
-
-        install_qwen3_sonic_configs()
-        # Qwen3MoeTopKRouter.forward, as the trainer's router patch runs it.
-        probs = F.softmax(router_logits, dtype=torch.float, dim=-1)
-        top_value, top_index = torch.topk(probs, top_k, dim=-1)
-        if renormalize:
-            top_value = top_value / top_value.sum(dim=-1, keepdim=True)
-        top_value = top_value.to(router_logits.dtype)
-        w13, w2 = layer.w13_weight, layer.w2_weight
-        num_experts, two_i, hidden = w13.shape
-        return sonic_experts_forward(
+    def apply(
+        self,
+        layer,
+        x,
+        router_logits,
+        top_k,
+        renormalize,
+        use_grouped_topk=False,
+        topk_group=None,
+        num_expert_group=None,
+        global_num_experts=-1,
+        expert_map=None,
+        custom_routing_function=None,
+        scoring_func="softmax",
+        e_score_correction_bias=None,
+        fused_shared_experts_scoring_func=None,
+        apply_router_weight_on_input=False,
+        activation=ActivationType.Silu,
+        prefix="",
+    ):
+        plain_softmax = (
+            not use_grouped_topk
+            and custom_routing_function is None
+            and scoring_func == "softmax"
+            and e_score_correction_bias is None
+            and not getattr(layer, "num_fused_shared_experts", 0)
+        )
+        if getattr(self, "fused_experts", None) is not None or apply_router_weight_on_input or not plain_softmax:
+            return orig_apply(
+                self, layer, x, router_logits, top_k, renormalize,
+                use_grouped_topk, topk_group, num_expert_group, global_num_experts,
+                expert_map, custom_routing_function, scoring_func, e_score_correction_bias,
+                fused_shared_experts_scoring_func, apply_router_weight_on_input, activation, prefix,
+            )
+        topk_weights, topk_ids, ones, x_rep = fused_route_expand(router_logits, x, top_k, renormalize)
+        return batch_invariant_experts_core(
             x,
-            top_index,
-            top_value,
-            w13.view(num_experts, hidden, two_i),
-            w2.view(num_experts, two_i // 2, hidden),
+            layer.w13_weight,
+            layer.w2_weight,
+            topk_weights,
+            topk_ids,
+            ones=ones,
+            x_rep=x_rep,
+            expert_mask=layer.expert_mask,
+            activation=activation,
         )
 
-    method.process_weights_after_loading = process_weights_after_loading
     method.apply = apply
-    print("[lumenrl] ATOM unquantized FusedMoE runs SonicMoE experts (LUMENRL_ALIGN_MOE=1)", flush=True)
+    print("[lumenrl] ATOM unquantized FusedMoE runs deterministic expanded fused_moe (LUMENRL_BATCH_INVARIANT_MOE=1)", flush=True)

@@ -907,7 +907,7 @@ class ATOMReplicaManager:
                 "LUMENRL_FP8_DECODE_GEMM",
                 "LUMENRL_ALIGN_SYNC_WEIGHTS",
                 "LUMENRL_ALIGN_WEIGHT_AUDIT",
-                "LUMENRL_ALIGN_MOE",
+                "LUMENRL_BATCH_INVARIANT_MOE",
                 "SONIC_MOE_GEMM_BACKEND",
                 "SONIC_MOE_USE_QWEN3_TUNED_GEMM",
                 "LUMENRL_PREFILL_DECODE_ATTN",

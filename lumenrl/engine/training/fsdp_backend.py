@@ -253,7 +253,17 @@ def _load_hf_model(model_name: str, torch_dtype: torch.dtype = torch.bfloat16) -
     # MoE only: run the fused HF experts as one SonicMoE grouped GEMM pair.
     # The gate is untouched, so the router patch above still applies. Weight
     # export maps the Sonic layout back to HF names (fsdp_engine).
-    if os.environ.get("LUMENRL_SONIC_MOE", "0") == "1":
+    # LUMENRL_BATCH_INVARIANT_MOE=1 (must match the rollout's flag): the same HF
+    # parameters run ATOM's deterministic fused_moe kernel forward and SonicMoE
+    # autograd backward (lumenrl/moe/batch_invariant_experts.py). Routing is the HF router.
+    if os.environ.get("LUMENRL_BATCH_INVARIANT_MOE", "0") == "1":
+        if os.environ.get("LUMENRL_SONIC_MOE", "0") == "1":
+            raise RuntimeError("LUMENRL_BATCH_INVARIANT_MOE=1 and LUMENRL_SONIC_MOE=1 are mutually exclusive")
+        from lumenrl.moe.batch_invariant_experts import replace_hf_moe_experts_batch_invariant
+
+        replaced = replace_hf_moe_experts_batch_invariant(model)
+        print(f"[lumenrl] deterministic fused_moe experts on {replaced} MoE blocks (rank {rank})", flush=True)
+    elif os.environ.get("LUMENRL_SONIC_MOE", "0") == "1":
         from lumen.modules.sonic_hf_experts import replace_hf_moe_experts
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
