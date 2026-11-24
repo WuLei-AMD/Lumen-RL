@@ -523,6 +523,10 @@ def causal_chunk_meta(q_bounds, k_bounds, total_keys, device):
         a, b = q_bounds[s], q_bounds[s + 1]
         ka = k_bounds[s]
         prefix = k_bounds[s + 1] - ka - (b - a)
+        if prefix < 0:
+            raise ValueError(
+                f"sequence {s} has {b - a} query rows but only {k_bounds[s + 1] - ka} keys"
+            )
         c = a
         while c < b:
             first = prefix + c - a  # keys before the chunk's first row

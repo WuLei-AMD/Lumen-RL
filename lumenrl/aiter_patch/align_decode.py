@@ -1209,14 +1209,38 @@ def patch_attention(module):
         meta = fwd_ctx.attn_metadata
         sliding = (self.sliding_window, 0, 0) if self.sliding_window > 0 else (-1, -1, 0)
 
-        def attend_each(ks, vs, ends, new_tokens):
+        def attend_each(ks, vs, ends, new_tokens, q_rows=None):
             """Each sequence's new rows over its own K/V, as training scores them.
 
             Without sinks or a sliding window this is the chunked causal call
             training and prefill use, with the same split of long rows.
             """
+            q_all = q if q_rows is None else q_rows
             if self.sinks is None and self.sliding_window <= 0:
                 from qlen1_attention import causal_chunk_meta, chunked_causal_attention
+
+                live = [i for i, (end, new) in enumerate(zip(ends, new_tokens)) if int(end) >= int(new)]
+                if len(live) < len(ends):
+                    # CUDA graph capture pads the batch with slots that have no keys
+                    # yet (context 0, one query row). Their rows are never read, so
+                    # they get zeros and only the live sequences are attended.
+                    starts = [0]
+                    for new in new_tokens:
+                        starts.append(starts[-1] + int(new))
+                    out = torch.zeros_like(q_all[: starts[-1]])
+                    if live:
+                        idx = torch.cat(
+                            [torch.arange(starts[i], starts[i + 1], device=q_all.device) for i in live]
+                        )
+                        sub = attend_each(
+                            [ks[i] for i in live],
+                            [vs[i] for i in live],
+                            [ends[i] for i in live],
+                            [new_tokens[i] for i in live],
+                            q_rows=q_all.index_select(0, idx),
+                        )
+                        out.index_copy_(0, idx, sub)
+                    return out
 
                 q_bounds, k_bounds = [0], [0]
                 for end, new in zip(ends, new_tokens):
@@ -1224,9 +1248,9 @@ def patch_attention(module):
                     k_bounds.append(k_bounds[-1] + int(end))
                 k_all = ks[0] if len(ks) == 1 else torch.cat(ks, 0)
                 v_all = vs[0] if len(vs) == 1 else torch.cat(vs, 0)
-                plan = causal_chunk_meta(q_bounds, k_bounds, k_all.shape[0], q.device)
+                plan = causal_chunk_meta(q_bounds, k_bounds, k_all.shape[0], q_all.device)
                 return chunked_causal_attention(
-                    q[: q_bounds[-1]], k_all, v_all, plan, self.scale
+                    q_all[: q_bounds[-1]], k_all, v_all, plan, self.scale
                 )
             import aiter
 
@@ -1235,10 +1259,10 @@ def patch_attention(module):
             for k_i, v_i, end, new in zip(ks, vs, ends, new_tokens):
                 end = int(end)
                 new = int(new)
-                cu_q_i = torch.tensor([0, new], dtype=torch.int32, device=q.device)
-                cu_k_i = torch.tensor([0, end], dtype=torch.int32, device=q.device)
+                cu_q_i = torch.tensor([0, new], dtype=torch.int32, device=q_all.device)
+                cu_k_i = torch.tensor([0, end], dtype=torch.int32, device=q_all.device)
                 res = aiter.flash_attn_varlen_func(
-                    q[row : row + new],
+                    q_all[row : row + new],
                     k_i,
                     v_i,
                     cu_seqlens_q=cu_q_i,
