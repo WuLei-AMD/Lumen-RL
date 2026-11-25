@@ -1791,3 +1791,48 @@ class LumenActorWorker(BaseWorker):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         super().cleanup()
+
+
+def _install_call_profiler() -> None:
+    """LUMENRL_PROFILE_CALLS=3,4 profiles those calls (1-based) of
+    compute_log_probs and update_policy on rank 0 and prints the kernel table."""
+    spec = os.environ.get("LUMENRL_PROFILE_CALLS", "")
+    if not spec:
+        return
+    wanted = {int(x) for x in spec.split(",") if x}
+    out_dir = os.environ.get("LUMENRL_PROFILE_DIR", "/logs/profile")
+
+    def wrap(name):
+        orig = getattr(LumenActorWorker, name)
+        count = [0]
+
+        def run(self, *args, **kwargs):
+            count[0] += 1
+            if int(self.rank) != 0 or count[0] not in wanted:
+                return orig(self, *args, **kwargs)
+            import time
+
+            from torch.profiler import ProfilerActivity, profile
+
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+                result = orig(self, *args, **kwargs)
+                torch.cuda.synchronize()
+            wall = time.perf_counter() - t0
+            os.makedirs(out_dir, exist_ok=True)
+            tag = f"{name}-call{count[0]}"
+            table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=40, max_name_column_width=90)
+            with open(os.path.join(out_dir, f"{tag}.txt"), "w") as f:
+                f.write(f"wall {wall:.4f}s\n{table}\n")
+            prof.export_chrome_trace(os.path.join(out_dir, f"{tag}.json"))
+            print(f"[lumenrl] profiled {tag}: wall {wall:.4f}s -> {out_dir}/{tag}.txt", flush=True)
+            return result
+
+        setattr(LumenActorWorker, name, run)
+
+    wrap("compute_log_probs")
+    wrap("update_policy")
+
+
+_install_call_profiler()

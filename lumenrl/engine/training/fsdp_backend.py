@@ -256,13 +256,28 @@ def _load_hf_model(model_name: str, torch_dtype: torch.dtype = torch.bfloat16) -
     # LUMENRL_BATCH_INVARIANT_MOE=1 (must match the rollout's flag): the same HF
     # parameters run ATOM's deterministic fused_moe kernel forward and SonicMoE
     # autograd backward (lumenrl/moe/batch_invariant_experts.py). Routing is the HF router.
+    # With LUMENRL_FP8_MOE=1 as well, the experts run the rollout's per_1x128 FP8 kernel
+    # (lumenrl/moe/batch_invariant_fp8_experts.py).
     if os.environ.get("LUMENRL_BATCH_INVARIANT_MOE", "0") == "1":
         if os.environ.get("LUMENRL_SONIC_MOE", "0") == "1":
             raise RuntimeError("LUMENRL_BATCH_INVARIANT_MOE=1 and LUMENRL_SONIC_MOE=1 are mutually exclusive")
-        from lumenrl.moe.batch_invariant_experts import replace_hf_moe_experts_batch_invariant
+        if os.environ.get("LUMENRL_FP8_MOE", "0") == "1":
+            from lumenrl.moe.batch_invariant_fp8_experts import replace_hf_moe_experts_batch_invariant_fp8
 
-        replaced = replace_hf_moe_experts_batch_invariant(model)
-        print(f"[lumenrl] deterministic fused_moe experts on {replaced} MoE blocks (rank {rank})", flush=True)
+            replaced = replace_hf_moe_experts_batch_invariant_fp8(model)
+            print(f"[lumenrl] deterministic FP8 fused_moe experts on {replaced} MoE blocks (rank {rank})", flush=True)
+        else:
+            from lumenrl.moe.batch_invariant_experts import replace_hf_moe_experts_batch_invariant
+
+            replaced = replace_hf_moe_experts_batch_invariant(model)
+            print(f"[lumenrl] deterministic fused_moe experts on {replaced} MoE blocks (rank {rank})", flush=True)
+    elif os.environ.get("LUMENRL_FP8_MOE", "0") == "1":
+        if os.environ.get("LUMENRL_SONIC_MOE", "0") == "1":
+            raise RuntimeError("LUMENRL_FP8_MOE=1 and LUMENRL_SONIC_MOE=1 are mutually exclusive")
+        from lumenrl.moe.fp8_experts import replace_hf_moe_experts_fp8
+
+        replaced = replace_hf_moe_experts_fp8(model)
+        print(f"[lumenrl] blockwise FP8 grouped experts on {replaced} MoE blocks (rank {rank})", flush=True)
     elif os.environ.get("LUMENRL_SONIC_MOE", "0") == "1":
         from lumen.modules.sonic_hf_experts import replace_hf_moe_experts
 
@@ -404,6 +419,20 @@ def _apply_lumen_fp8(model: nn.Module, quant_config: dict[str, Any]) -> nn.Modul
             )
         cfg = LumenConfig(**kwargs)
         _manager, model = cfg.enable(model)
+
+        if (
+            fp8_enabled
+            and os.environ.get("LUMEN_FP8_DENSE", "0") == "1"
+            and kwargs.get("scaling") == "blockwise2d"
+        ):
+            from lumen.ops.gemm.fp8_dense import patch_qwen3_fp8_dense
+
+            # Training logprobs match ATOM rollout only on the GEMM rollout runs:
+            # its Triton kernel unless LUMEN_FP8_DENSE_FWD names another.
+            fwd = "triton" if atom_ops else None
+            n_dense = patch_qwen3_fp8_dense(model, forward_kind=fwd)
+            print(f"[lumenrl] LUMEN_FP8_DENSE=1: {n_dense} Qwen3 blocks on FP8 dense linears "
+                  f"(atom_ops={atom_ops or '(none)'})", flush=True)
 
         # verl-aligned (fsdp_utils._maybe_apply_lumen): restore lm_head to BF16.
         # The lm_head FP8 blockscale GEMM overflows INT32 on the huge vocab GEMM

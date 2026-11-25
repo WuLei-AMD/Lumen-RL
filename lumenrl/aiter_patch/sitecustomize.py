@@ -294,14 +294,15 @@ if os.environ.get("LUMENRL_ALIGN_SYNC_WEIGHTS") == "1":
 
 
 def _install_fp8_decode_gemm_config():
-    """Narrow BLOCK_N of the Triton blockscale GEMM at decode M.
+    """Narrow BLOCK_N of the Triton blockscale GEMM when this M underfills the GPU.
 
-    aiter's M<=8 tile is often BLOCK_N=32, so a narrow N launches fewer
+    M is the row count, and on decode that is the number of live sequences.
+    aiter's tile is often BLOCK_N=128 or 32, so a short batch launches fewer
     programs than the GPU has CUs. Halve BLOCK_N (down to 16) until the grid
     covers the CUs. Only configs that already reduce K as one split of 128
-    are touched: that is the order training uses, so a row at M<=8 stays the
-    same value as the row training computes at any M. Every other shape keeps
-    aiter's own tile.
+    are touched: that is the order training uses, so a row stays the same
+    value as the row training computes at any M. A batch whose grid already
+    covers the CUs keeps aiter's tile.
     """
     target = "aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale"
     cu_count = None
@@ -343,7 +344,7 @@ def _install_fp8_decode_gemm_config():
         def _get_config(M, N, K, *args, **kwargs):
             shuffle = args[0] if args else kwargs.get("shuffle", False)
             config, tuned = current(M, N, K, *args, **kwargs)
-            if M <= 8 and not shuffle:
+            if not shuffle:
                 _narrow_block_n(config, M, N)
             return config, tuned
 
