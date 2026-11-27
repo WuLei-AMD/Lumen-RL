@@ -60,6 +60,45 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "WARN"))
 
 
+def _sonic_param_to_hf(name: str, param: torch.Tensor) -> tuple[str, torch.Tensor]:
+    from torch.distributed.tensor import Replicate, Shard
+
+    from lumen.modules.sonic_hf_experts import hf_expert_state
+
+    if not isinstance(param, DTensor):
+        return hf_expert_state(name, param)
+    if not all(p == Shard(0) or isinstance(p, Replicate) for p in param.placements):
+        return hf_expert_state(name, param.full_tensor())
+    # The layout change is per expert, so dim-0 shards convert locally and the
+    # caller's full_tensor() gathers them as usual.
+    hf_name, local = hf_expert_state(name, param.to_local())
+    global_shape = (param.shape[0], *local.shape[1:])
+    return hf_name, DTensor.from_local(
+        local, param.device_mesh, param.placements, run_check=False,
+        shape=torch.Size(global_shape), stride=torch.empty(global_shape, device="meta").stride(),
+    )
+
+
+class _HFNamedParams:
+    """State-dict view under HF names, with SonicMoE experts in HF layout.
+
+    Re-iterable: ``update_weights_ipc_send`` walks it once for bucket sizing
+    before sending.
+    """
+
+    def __init__(self, params: dict[str, torch.Tensor]):
+        self._params = params
+
+    def __iter__(self):
+        from lumen.modules.sonic_hf_experts import is_sonic_expert_param
+
+        for name, param in self._params.items():
+            if is_sonic_expert_param(name):
+                yield _sonic_param_to_hf(name, param)
+            else:
+                yield name, param
+
+
 class FSDP2Engine(BaseEngine):
     """Concrete engine implementation backed by PyTorch FSDP2 (``fully_shard``).
 
@@ -672,6 +711,8 @@ class FSDP2Engine(BaseEngine):
         params = self.module.state_dict()
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.module)
+        if any(name.endswith((".experts.w1", ".experts.w2")) for name in params):
+            return _HFNamedParams(params), None
         return params.items(), None
 
     def disable_adapter(self) -> ContextManager:

@@ -93,6 +93,11 @@ def layer_index_of(name: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def replay_installed() -> bool:
+    """True while rollout routing is installed for the current micro-batch."""
+    return _current() is not None
+
+
 def apply_replay(router_probs: torch.Tensor, indices: torch.Tensor,
                  layer_idx: int | None) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Swap in the rollout's expert ids for this layer; regather the weights.

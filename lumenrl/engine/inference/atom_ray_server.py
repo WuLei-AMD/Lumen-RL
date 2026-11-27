@@ -54,6 +54,12 @@ def _weight_sync_session(core_mgr: Any) -> AbstractContextManager[None]:
     return session()
 
 
+def _profile_calls() -> set[int]:
+    """1-based generate_batch calls to profile (LUMENRL_ATOM_PROFILE_CALLS=2,3)."""
+    spec = os.environ.get("LUMENRL_ATOM_PROFILE_CALLS", "")
+    return {int(x) for x in spec.split(",") if x.strip()}
+
+
 class ATOMRayServer:
     """Ray actor hosting one ATOM AsyncLLMEngine on a colocated GPU."""
 
@@ -75,6 +81,9 @@ class ATOMRayServer:
         # ATOM's preemption counter is cumulative; keep the last reading so
         # each batch can report its own.
         self._preemptions_seen = 0
+        # LUMENRL_ATOM_PROFILE_CALLS=2 wraps the 2nd generate_batch of replica 0 in ATOM's
+        # torch profiler (ATOM_TORCH_PROFILER_DIR sets where the trace goes).
+        self._generate_calls = 0
 
     async def launch(self) -> bool:
         from atom.rollout.async_engine import AsyncLLMEngine
@@ -283,8 +292,17 @@ class ATOMRayServer:
                 sp.n = n
             params.append(sp)
 
+        self._generate_calls += 1
+        profile_this = self.replica_rank == 0 and self._generate_calls in _profile_calls()
+
         def _generate_blocking():
-            return self.engine.generate(grouped_prompts, params, request_ids=request_ids)
+            if profile_this:
+                self.engine.start_profile()
+            try:
+                return self.engine.generate(grouped_prompts, params, request_ids=request_ids)
+            finally:
+                if profile_this:
+                    logger.info("ATOMRayServer[0]: profile stop: %s", self.engine.stop_profile())
 
         outs = await asyncio.get_event_loop().run_in_executor(None, _generate_blocking)
         self._log_kv_pressure()
@@ -904,8 +922,14 @@ class ATOMReplicaManager:
                 "LUMENRL_ALIGN_STATIC_DECODE",
                 "LUMENRL_ALIGN_POOL_SLOTS",
                 "LUMENRL_ALIGN_SPLIT_KEYS",
+                "LUMENRL_ALIGN_STATIC_BLOCKS",
                 "LUMENRL_FP8_DECODE_GEMM",
                 "LUMENRL_ALIGN_SYNC_WEIGHTS",
+                "LUMENRL_ALIGN_WEIGHT_AUDIT",
+                "LUMENRL_BATCH_INVARIANT_MOE",
+                "LUMENRL_BI_ROUTER_GEMM",
+                "SONIC_MOE_GEMM_BACKEND",
+                "SONIC_MOE_USE_QWEN3_TUNED_GEMM",
                 "LUMENRL_PREFILL_DECODE_ATTN",
                 "LUMENRL_STABLE_GEMM",
                 "LUMENRL_PREFILL_RESCORE",

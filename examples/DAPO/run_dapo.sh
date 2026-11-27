@@ -146,6 +146,15 @@ if [ "$MODE" = "atomfp8" ] || [ "$MODE" = "atom_fp8" ] || \
     export LUMENRL_PREFILL_DECODE_ATTN="${LUMENRL_PREFILL_DECODE_ATTN:-1}"
     export LUMENRL_ROWWISE_TRAIN_ATTN="${LUMENRL_ROWWISE_TRAIN_ATTN:-1}"
     export LUMENRL_PREFILL_RESCORE="${LUMENRL_PREFILL_RESCORE:-0}"
+    # Qwen3-30B-A3B only. Dense Qwen3-8B has no experts; these stay unset there.
+    case "${MODEL_PATH}${CONFIG_OVERRIDE:-}" in
+      *30B-A3B*|*30b-a3b*|*30b_a3b*|*qwen3moe*)
+        # LUMENRL_BATCH_INVARIANT_MOE=1 selects the batch-invariant experts instead; SonicMoE defaults must not be set with it.
+        if [ "${LUMENRL_BATCH_INVARIANT_MOE:-0}" != "1" ]; then
+          export LUMENRL_SONIC_MOE="${LUMENRL_SONIC_MOE:-1}"
+        fi
+        ;;
+    esac
     if [ "${LUMENRL_PREFILL_RESCORE}" = "1" ]; then
       export LUMENRL_RESCORE_DIR="${LUMENRL_RESCORE_DIR:-/tmp/lumenrl-prefill-rescore}"
     fi

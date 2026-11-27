@@ -394,7 +394,7 @@ def _pool(module, like):
     """This layer's K/V pool.
 
     Static decode captures a CUDA graph on the pool's address, so that path
-    allocates ``_pool_slots()`` sequence slots plus one scratch slot once and
+    allocates ``_pool_slots()`` sequence slots plus a scratch slot once and
     never moves it. The eager path grows, as it did before static decode.
     """
     if _flag("LUMENRL_ALIGN_STATIC_DECODE"):
@@ -410,7 +410,7 @@ def _pool_fixed(module, like):
             f"batched decode: {_num_slots} concurrent sequences exceed "
             f"LUMENRL_ALIGN_POOL_SLOTS={slots}"
         )
-    need = (slots + 1) * cap
+    need = slots * cap + _scratch_rows(cap)
     pool = getattr(module, "_lumenrl_pool", None)
     if pool is not None:
         if _pool_mismatch(pool, like) or pool[0].shape[0] != need:
@@ -447,6 +447,10 @@ def _pool_grow(module, like):
 
 # Index buffers of decode_static_attention, at fixed addresses for CUDA graphs.
 _static = None
+# This step's decode exceeds the static entry budget and runs eager; and how many have.
+_eager_step = False
+_eager_steps = 0
+_decode_steps = 0
 
 
 def _cap() -> int:
@@ -471,6 +475,35 @@ def _static_rows() -> int:
         return int(os.environ.get("LUMENRL_ALIGN_STATIC_ROWS", "64"))
 
 
+def _static_per_row() -> int:
+    """LUMENRL_ALIGN_STATIC_BLOCKS: static decode's entry budget in blocks a row (0: full width)."""
+    return int(os.environ.get("LUMENRL_ALIGN_STATIC_BLOCKS", "0") or 0)
+
+
+def _static_entries(rows, cap) -> int:
+    return _qlen1().static_entries(rows, -(-cap // _qlen1().SPLIT_KEYS), _static_per_row())
+
+
+def _static_fits(lens, cap) -> bool:
+    """Whether a decode step of rows with ``lens`` keys fits the static entry budget."""
+    rows = len(lens)
+    split = _qlen1().SPLIT_KEYS
+    width = -(-cap // split)
+    entries = _static_entries(rows, cap)
+    real = sum(-(-int(n) // split) for n in lens)
+    # A budgeted launch leaves room for the padding entry of a larger graph's padded rows.
+    return real + (0 if entries == rows * width else 1) <= entries
+
+
+def _scratch_rows(cap) -> int:
+    """Rows of the pool's scratch slot: one per padded entry plus one per padded row.
+
+    At least ``cap``; a small LUMENRL_ALIGN_SPLIT_KEYS needs more than one slot's worth.
+    """
+    rows = _static_rows()
+    return max(cap, _static_entries(rows, cap) + 1 + rows)
+
+
 def _static_buffers(device, rep):
     global _static
     cap = _pool_cap()
@@ -492,13 +525,15 @@ def _static_buffers(device, rep):
     qa = _qlen1()
     rows = _static_rows()
     width = -(-cap // qa.SPLIT_KEYS)
-    entries = rows * width
-    if entries + 1 + rows > cap:
-        raise RuntimeError(f"batched decode: scratch slot of {cap} rows cannot hold {entries} entries")
+    entries = _static_entries(rows, cap)
+    if entries + 1 + rows > _scratch_rows(cap):
+        raise RuntimeError(f"batched decode: scratch slot of {_scratch_rows(cap)} rows cannot hold {entries} entries")
     i32 = dict(dtype=torch.int32, device=device)
     _static = {
         "rows": rows,
         "width": width,
+        "per_row": _static_per_row(),
+        "entries": entries,
         "rep": rep,
         "cap": cap,
         "slots": slots,
@@ -516,7 +551,7 @@ def _static_buffers(device, rep):
     return _static
 
 
-def _static_lists(row_starts, row_lens, order, rows, width, scratch, split, rep):
+def _static_lists(row_starts, row_lens, order, rows, width, entries, scratch, split, rep):
     """Host contents of the decode_static_attention buffers.
 
     ``row_starts[i]``/``row_lens[i]`` are pool start and key count of real
@@ -527,7 +562,6 @@ def _static_lists(row_starts, row_lens, order, rows, width, scratch, split, rep)
     and the query copy skip them.
     """
     n = len(row_lens)
-    entries = rows * width
     write_dst = [row_starts[i] + row_lens[i] - 1 for i in range(n)] + [scratch + i for i in range(n, rows)]
     gather, k_start, k_len = [], [], []
     idx = [[0] * width for _ in range(rows)]
@@ -544,6 +578,8 @@ def _static_lists(row_starts, row_lens, order, rows, width, scratch, split, rep)
             raise RuntimeError(f"batched decode: row of {row_lens[i]} keys needs {parts} > {width} blocks")
         npart[i] = parts
     real = len(gather)
+    if real + (1 if n < rows else 0) > entries:
+        raise RuntimeError(f"batched decode: {real} blocks exceed the static budget of {entries} entries")
     for i in range(n, rows):
         idx[i][0] = real
     for e in range(real, entries):
@@ -579,7 +615,7 @@ def _fill_static(plan):
         starts, lens = row_starts, row_lens
         order = list(perm)
     write_dst, gather, cu_k, k_start, idx, npart, cu_q = _static_lists(
-        starts, lens, order, st["rows"], st["width"], st["scratch"], _qlen1().SPLIT_KEYS, st["rep"]
+        starts, lens, order, st["rows"], st["width"], st["entries"], st["scratch"], _qlen1().SPLIT_KEYS, st["rep"]
     )
     device = st["gather"].device
     # dst never changes, but is uploaded too: sleep mode may drop device
@@ -605,7 +641,21 @@ def _static_step(plan) -> bool:
         and plan["complete"]
         and plan["rows"] == len(plan["slots"])
         and plan["rows"] <= (_static["rows"] if _static is not None else _static_rows())
+        and _static_fits(plan["lens"], plan["cap"])
     )
+
+
+def _decode_over_budget(batch, config) -> bool:
+    """A decode batch whose blocks exceed the static entry budget; it must not replay a graph."""
+    if not (_flag("LUMENRL_ALIGN_STATIC_DECODE") and _batched()) or _static_per_row() <= 0:
+        return False
+    if batch is None or getattr(batch, "is_dummy_run", False):
+        return False
+    if int(getattr(batch, "total_tokens_num_prefill", 0) or 0) > 0:
+        return False
+    n = int(getattr(batch, "total_seqs_num", 0) or 0)
+    lens = [int(x) for x in list(batch.context_lens)[:n]]
+    return bool(lens) and not _static_fits(lens, _configured_capacity(config))
 
 
 _qa = None
@@ -794,9 +844,36 @@ def _patch_runner_kv_plan(module):
             if _retired_seen:
                 _retired.clear()
 
+    orig_prepare_model = runner.prepare_model
+
+    def prepare_model(self, batch, *args, **kwargs):
+        # ForwardMode.decide runs in here, before prepare_inputs plans the step.
+        global _eager_step, _eager_steps, _decode_steps
+        _eager_step = _decode_over_budget(batch, getattr(self, "config", None))
+        if _static_per_row() > 0 and batch is not None and not getattr(batch, "is_dummy_run", False) \
+                and int(getattr(batch, "total_tokens_num_prefill", 0) or 0) == 0:
+            _decode_steps += 1
+            _eager_steps += int(_eager_step)
+            if _decode_steps % 2000 == 0:
+                print(f"[lumenrl] static decode budget: {_eager_steps}/{_decode_steps} decode steps ran eager", flush=True)
+        builder = type(self.attn_metadata_builder)
+        if not getattr(builder.step_needs_eager, "_lumenrl_budget", False):
+            orig_needs = builder.step_needs_eager
+
+            def step_needs_eager(b, batch, _orig=orig_needs):
+                return _eager_step or _orig(b, batch)
+
+            step_needs_eager._lumenrl_budget = True
+            builder.step_needs_eager = step_needs_eager
+        try:
+            return orig_prepare_model(self, batch, *args, **kwargs)
+        finally:
+            _eager_step = False
+
     prepare_inputs._lumenrl_kv_plan = True
     runner.prepare_inputs = prepare_inputs
     runner.run_model = run_model
+    runner.prepare_model = prepare_model
 
 
 def _install_scheduler_retirement():
@@ -1209,14 +1286,38 @@ def patch_attention(module):
         meta = fwd_ctx.attn_metadata
         sliding = (self.sliding_window, 0, 0) if self.sliding_window > 0 else (-1, -1, 0)
 
-        def attend_each(ks, vs, ends, new_tokens):
+        def attend_each(ks, vs, ends, new_tokens, q_rows=None):
             """Each sequence's new rows over its own K/V, as training scores them.
 
             Without sinks or a sliding window this is the chunked causal call
             training and prefill use, with the same split of long rows.
             """
+            q_all = q if q_rows is None else q_rows
             if self.sinks is None and self.sliding_window <= 0:
                 from qlen1_attention import causal_chunk_meta, chunked_causal_attention
+
+                live = [i for i, (end, new) in enumerate(zip(ends, new_tokens)) if int(end) >= int(new)]
+                if len(live) < len(ends):
+                    # CUDA graph capture pads the batch with slots that have no keys
+                    # yet (context 0, one query row). Their rows are never read, so
+                    # they get zeros and only the live sequences are attended.
+                    starts = [0]
+                    for new in new_tokens:
+                        starts.append(starts[-1] + int(new))
+                    out = torch.zeros_like(q_all[: starts[-1]])
+                    if live:
+                        idx = torch.cat(
+                            [torch.arange(starts[i], starts[i + 1], device=q_all.device) for i in live]
+                        )
+                        sub = attend_each(
+                            [ks[i] for i in live],
+                            [vs[i] for i in live],
+                            [ends[i] for i in live],
+                            [new_tokens[i] for i in live],
+                            q_rows=q_all.index_select(0, idx),
+                        )
+                        out.index_copy_(0, idx, sub)
+                    return out
 
                 q_bounds, k_bounds = [0], [0]
                 for end, new in zip(ends, new_tokens):
@@ -1224,9 +1325,9 @@ def patch_attention(module):
                     k_bounds.append(k_bounds[-1] + int(end))
                 k_all = ks[0] if len(ks) == 1 else torch.cat(ks, 0)
                 v_all = vs[0] if len(vs) == 1 else torch.cat(vs, 0)
-                plan = causal_chunk_meta(q_bounds, k_bounds, k_all.shape[0], q.device)
+                plan = causal_chunk_meta(q_bounds, k_bounds, k_all.shape[0], q_all.device)
                 return chunked_causal_attention(
-                    q[: q_bounds[-1]], k_all, v_all, plan, self.scale
+                    q_all[: q_bounds[-1]], k_all, v_all, plan, self.scale
                 )
             import aiter
 
@@ -1235,10 +1336,10 @@ def patch_attention(module):
             for k_i, v_i, end, new in zip(ks, vs, ends, new_tokens):
                 end = int(end)
                 new = int(new)
-                cu_q_i = torch.tensor([0, new], dtype=torch.int32, device=q.device)
-                cu_k_i = torch.tensor([0, end], dtype=torch.int32, device=q.device)
+                cu_q_i = torch.tensor([0, new], dtype=torch.int32, device=q_all.device)
+                cu_k_i = torch.tensor([0, end], dtype=torch.int32, device=q_all.device)
                 res = aiter.flash_attn_varlen_func(
-                    q[row : row + new],
+                    q_all[row : row + new],
                     k_i,
                     v_i,
                     cu_seqlens_q=cu_q_i,

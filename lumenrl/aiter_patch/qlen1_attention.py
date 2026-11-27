@@ -523,6 +523,10 @@ def causal_chunk_meta(q_bounds, k_bounds, total_keys, device):
         a, b = q_bounds[s], q_bounds[s + 1]
         ka = k_bounds[s]
         prefix = k_bounds[s + 1] - ka - (b - a)
+        if prefix < 0:
+            raise ValueError(
+                f"sequence {s} has {b - a} query rows but only {k_bounds[s + 1] - ka} keys"
+            )
         c = a
         while c < b:
             first = prefix + c - a  # keys before the chunk's first row
@@ -668,11 +672,28 @@ def decode_split_attention(q, k_pool, v_pool, plan, softmax_scale, pending=None)
     return out
 
 
+def static_entries(rows, width, per_row):
+    """Grouped entries ``decode_static_attention`` launches for a batch of ``rows`` rows.
+
+    ``rows * width`` covers every row at full capacity. The fmha kernel pays for an
+    entry whether or not it has query rows, so with ``per_row`` > 0 the launch is
+    a budget of ``per_row`` blocks a row (at least one full row) plus the padding
+    entry; a step that needs more runs eager. Up to STATIC_FULL_ROWS rows always
+    get full width, as the long tail of a rollout decodes a few long rows.
+    """
+    if per_row <= 0 or per_row >= width:
+        return rows * width
+    return min(rows * width, max(width * STATIC_FULL_ROWS, rows * per_row) + 1)
+
+
+STATIC_FULL_ROWS = 4
+
+
 def decode_static_attention(q, k_new, v_new, k_pool, v_pool, st, softmax_scale, rope=None, quant_dtype=None):
     """``decode_split_attention`` with a launch shape fixed by ``q.shape[0]``.
 
-    Every decode row owns ``st["width"]`` grouped entries, so a step of
-    ``rows`` rows always launches ``rows * width`` entries and every index
+    A step of ``rows`` rows always launches ``static_entries(rows, ...)``
+    entries, the real ones first, and every index
     lives in the buffers of ``st`` (filled on the host before the step). A
     CUDA graph captured once per batch size then replays any step. Entries a
     row does not need get no query rows in ``st["cu_q"]``, so attention skips
@@ -687,7 +708,7 @@ def decode_static_attention(q, k_new, v_new, k_pool, v_pool, st, softmax_scale, 
     rows, hq, dim = q.shape
     hk = k_pool.shape[1]
     rep = hq // hk
-    entries = rows * st["width"]
+    entries = static_entries(rows, st["width"], st["per_row"])
     if not (q.stride(2) == 1 and q.stride(1) == dim):
         q = q.contiguous()
     grouped = pool_write_group_queries(
